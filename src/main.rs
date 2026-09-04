@@ -951,6 +951,36 @@ impl Model {
         }
         counts.iter().map(|c| std::array::from_fn(|e| c[e] as Float / total.max(1) as Float)).collect()
     }
+
+    /// Where the router sends things, on `docs`: per layer, the primary (slot 0) expert chosen
+    /// for each input character and for each position, as percentages of that row.
+    /// Returned as (by_char[layer][char][expert], by_pos[layer][pos][expert]).
+    #[allow(clippy::type_complexity)]
+    fn expert_routing(&self, p: &[Float], data: &Dataset, docs: &[String], acts: &mut Acts, tokens: &mut Vec<usize>) -> (Vec<Vec<[Float; N_EXPERTS]>>, Vec<Vec<[Float; N_EXPERTS]>>) {
+        let mut pt = vec![0.0 as Float; p.len()];
+        self.transpose_into(p, &mut pt);
+        let v = self.vocab_size;
+        let mut by_char = vec![vec![[0usize; N_EXPERTS]; v]; N_LAYER];
+        let mut by_pos = vec![vec![[0usize; N_EXPERTS]; BLOCK_SIZE]; N_LAYER];
+        for doc in docs {
+            data.tokenize(doc, tokens);
+            let n = (tokens.len() - 1).min(BLOCK_SIZE);
+            self.forward(p, &pt, tokens, 0, n, acts);
+            for (l, la) in acts.layers.iter().enumerate() {
+                for i in 0..n {
+                    let e = la.sel[i * TOP_K];
+                    by_char[l][tokens[i]][e] += 1;
+                    by_pos[l][i][e] += 1;
+                }
+            }
+        }
+        let pct = |rows: Vec<Vec<[usize; N_EXPERTS]>>| -> Vec<Vec<[Float; N_EXPERTS]>> {
+            rows.into_iter()
+                .map(|layer| layer.into_iter().map(|c| { let t = c.iter().sum::<usize>().max(1) as Float; std::array::from_fn(|e| c[e] as Float / t) }).collect())
+                .collect()
+        };
+        (pct(by_char), pct(by_pos))
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1478,6 +1508,25 @@ fn main() -> io::Result<()> {
         for (l, usage) in model.expert_usage(&params, &data, data.eval_docs(), &mut acts, &mut tokens).iter().enumerate() {
             let pct: Vec<String> = usage.iter().map(|u| format!("{:.0}%", 100.0 * u)).collect();
             writeln!(out, "layer {l} expert usage on held-out names: {}", pct.join(" / "))?;
+        }
+        if std::env::var("MICROGPT_EXPERT_STATS").is_ok() {
+            let (by_char, by_pos) = model.expert_routing(&params, &data, data.eval_docs(), &mut acts, &mut tokens);
+            let header: String = (0..N_EXPERTS).map(|e| format!("{e:>4}")).collect();
+            for l in 0..N_LAYER {
+                writeln!(out, "--- layer {l}: primary expert by input character (% of that character's positions)")?;
+                writeln!(out, "   char{header}")?;
+                for (t, row) in by_char[l].iter().enumerate() {
+                    let label = if t == data.bos { "BOS".to_string() } else { data.uchars[t].to_string() };
+                    let cells: String = row.iter().map(|x| format!("{:>4.0}", 100.0 * x)).collect();
+                    writeln!(out, "   {label:>4}{cells}")?;
+                }
+                writeln!(out, "--- layer {l}: primary expert by position")?;
+                writeln!(out, "    pos{header}")?;
+                for (i, row) in by_pos[l].iter().enumerate() {
+                    let cells: String = row.iter().map(|x| format!("{:>4.0}", 100.0 * x)).collect();
+                    writeln!(out, "   {i:>4}{cells}")?;
+                }
+            }
         }
     }
 

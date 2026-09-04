@@ -146,6 +146,19 @@ rather than collapsing: 44/9/8/40% for 4 experts, and with 8 experts two of them
 3%; the held-out loss is the same at 4 experts (2.121 vs 2.114 at 16 x 4, 2.087 vs 2.089 at
 64 x 4) and slightly worse at 8 (2.080 vs 2.073).
 
+What the experts learn: set `MICROGPT_EXPERT_STATS=1` to print, per layer, which expert each
+input character and each position is routed to on the held-out names. For the 8-experts-of-64
+model the split is by character class. One expert takes every name start (100% of BOS, 83% of
+position 1) and most initial consonants; one takes `a` (94%); one takes `e`, `i`, `y` (78-88%);
+one takes `o`; one takes `n`, `r`, `x`; one takes `h`, `l`, `s`; one takes `v`, `d`, `g`, `t`;
+and one mostly handles second positions and `u`. In a character model the current character
+largely fixes the shape of the next-character distribution (after a vowel a consonant is likely,
+after `q` a `u`), so an MLP specialised per character group is a better use of the same compute
+than one MLP that must serve all of them. The stacked 2-layer, 32-dim, 8-expert model
+(`MICROGPT_N_LAYER=2 MICROGPT_N_EMBD=32 MICROGPT_N_EXPERTS=8 MICROGPT_TOP_K=2 MICROGPT_HIDDEN=64`,
+76,480 params) reaches 2.024 at 64 x 4 in 17.8 s, only marginally better than the dense 2-layer
+32-dim model's 2.026 in 7.5 s: at 640k names the two capacity gains barely stack.
+
 ### Findings from the sweeps (held-out loss, 4 threads unless noted)
 
 - **Seed noise:** four seeds of `20000 16 4` end at 2.120-2.130, so differences under ~0.01 are noise.

@@ -212,6 +212,23 @@
       </tbody>
     </table></div>
     <p>Three readings. Top-2 at the dense model's per-token compute (4 experts of 32) already beats it by 0.01 to 0.015, above the noise floor. More and wider experts keep helping when there is data to feed them: 8 experts of 64 at 64 x 4 reaches 2.049 in 5.6 s, better and faster than the 32-dim dense single layer (2.053 in 7.9 s), which is the whole promise of the architecture in miniature. And top-1 is worse than dense: each token then gets a 32-wide expert instead of a 64-wide MLP, and with a single gate there is no gate gradient to teach the router. Held-out expert usage stayed within a few percent of even in every top-2 run. Switching the balancing loss off was measured too: routing goes lopsided rather than collapsing (44/9/8/40% with 4 experts; with 8, two experts end at 0% and 3%), the loss is unchanged at 4 experts and about 0.007 worse at 8. At this scale the balancing term is cheap insurance rather than a necessity.</p>
+    <h3>What the experts learned</h3>
+    <p>With <code>MICROGPT_EXPERT_STATS=1</code> a run prints which expert each input character and each position is routed to on the held-out names. For the 8-experts-of-64 model the split is by character class, and it is sharp:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Expert</th><th>Takes (share of that character's positions)</th></tr></thead>
+      <tbody>
+        <tr><td>6</td><td>every name start (100% of BOS, 83% of position 1) and initial consonants: <code>j</code> 87%, <code>b</code> 64%, <code>p</code> 64%, <code>f</code> 56%, <code>k</code> 53%, <code>c</code> 50%</td></tr>
+        <tr><td>1</td><td><code>a</code> 94%</td></tr>
+        <tr><td>3</td><td><code>e</code> 88%, <code>y</code> 81%, <code>i</code> 78%</td></tr>
+        <tr><td>2</td><td><code>o</code> 68%, some <code>z</code>, <code>k</code>, <code>m</code></td></tr>
+        <tr><td>5</td><td><code>x</code> 71%, <code>r</code> 69%, <code>n</code> 63%</td></tr>
+        <tr><td>7</td><td><code>l</code> 79%, <code>h</code> 71%, <code>s</code> 43%, and the last positions of long names</td></tr>
+        <tr><td>0</td><td><code>v</code> 88%, <code>d</code> 61%, <code>g</code> 54%, <code>t</code> 54%</td></tr>
+        <tr><td>4</td><td>second positions and <code>u</code>: the vowel right after an initial consonant</td></tr>
+      </tbody>
+    </table></div>
+    <p>This is why the mixture helps. In a character model, the current character largely fixes the shape of the next-character distribution: after a vowel a consonant is likely, after <code>q</code> comes <code>u</code>, after a name's first consonant comes a vowel. A single 64-wide MLP has to encode all of those regimes in one set of weights; eight specialised ones each encode a few, and the router, reading the hidden state, has learned to recognise the regime. The router was never told about characters. It found this split because sending like tokens to the same expert lowered the loss, and the balancing term kept it from parking everything on one or two experts.</p>
+    <p>Stacking both capacity gains was tried too: 2 layers, 32-dim, 8 experts of 64, top-2 (76,480 parameters) reaches 2.024 at 64 x 4 in 17.8 s, against 2.026 in 7.5 s for the dense 2-layer 32-dim model. At 640k names the gains barely stack; the model is no longer the limit, the data is.</p>
     <p class="note">Expert usage is printed per layer at the end of every mixture-of-experts run. Build with <code>MICROGPT_N_EXPERTS=8 MICROGPT_TOP_K=2 MICROGPT_HIDDEN=64 cargo build --release</code>.</p>
   </section>
 
