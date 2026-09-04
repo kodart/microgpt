@@ -38,11 +38,13 @@ type Float = f64;
 // Hyperparameters (same values as the gist)
 // ---------------------------------------------------------------------------------------------
 
-// N_LAYER, N_EMBD, BLOCK_SIZE and N_HEAD come from build.rs: the gist's values (1, 16, 16, 4)
-// unless overridden with MICROGPT_N_LAYER / MICROGPT_N_EMBD / ... at build time.
+// N_LAYER, N_EMBD, BLOCK_SIZE, N_HEAD, N_EXPERTS, TOP_K and N_HIDDEN come from build.rs: the
+// gist's values (1, 16, 16, 4, dense MLP of width 64) unless overridden with MICROGPT_N_LAYER,
+// MICROGPT_N_EMBD, MICROGPT_N_EXPERTS, MICROGPT_TOP_K, ... at build time.
 include!(concat!(env!("OUT_DIR"), "/model_config.rs"));
 const HEAD_DIM: usize = N_EMBD / N_HEAD; // dimension of each head
-const N_HIDDEN: usize = 4 * N_EMBD; // MLP hidden width
+const MOE: bool = N_EXPERTS > 1; // a router chooses TOP_K of N_EXPERTS MLPs per token
+const AUX_LOSS_COEF: Float = 0.01; // weight of the expert load-balancing loss (Switch Transformer style)
 const INIT_STD: Float = 0.08; // std of the gaussian parameter init
 const RMS_EPS: Float = 1e-5; // rmsnorm epsilon
 
@@ -325,10 +327,11 @@ impl Tensor {
 }
 
 struct LayerShapes {
-    wqkv: Tensor, // [3*n_embd][n_embd]: fused attn_wq / attn_wk / attn_wv
-    wo: Tensor,   // [n_embd][n_embd]
-    fc1: Tensor,  // [4*n_embd][n_embd]
-    fc2: Tensor,  // [n_embd][4*n_embd]
+    wqkv: Tensor,     // [3*n_embd][n_embd]: fused attn_wq / attn_wk / attn_wv
+    wo: Tensor,       // [n_embd][n_embd]
+    router: Tensor,   // [N_EXPERTS][n_embd] expert scores; empty (0 rows) for a dense MLP
+    fc1: Vec<Tensor>, // per expert: [N_HIDDEN][n_embd]
+    fc2: Vec<Tensor>, // per expert: [n_embd][N_HIDDEN]
 }
 
 struct Model {
@@ -355,8 +358,9 @@ impl Model {
             .map(|_| LayerShapes {
                 wqkv: alloc(3 * N_EMBD, N_EMBD),
                 wo: alloc(N_EMBD, N_EMBD),
-                fc1: alloc(N_HIDDEN, N_EMBD),
-                fc2: alloc(N_EMBD, N_HIDDEN),
+                router: alloc(if MOE { N_EXPERTS } else { 0 }, N_EMBD),
+                fc1: (0..N_EXPERTS).map(|_| alloc(N_HIDDEN, N_EMBD)).collect(),
+                fc2: (0..N_EXPERTS).map(|_| alloc(N_EMBD, N_HIDDEN)).collect(),
             })
             .collect();
         Model { vocab_size, wte, wpe, lm_head, layers, n_params: n }
@@ -368,7 +372,9 @@ impl Model {
 
     /// The weight matrices used by linear layers, i.e. everything except the embedding tables.
     fn linear_tensors(&self) -> impl Iterator<Item = Tensor> + '_ {
-        std::iter::once(self.lm_head).chain(self.layers.iter().flat_map(|l| [l.wqkv, l.wo, l.fc1, l.fc2]))
+        std::iter::once(self.lm_head).chain(self.layers.iter().flat_map(|l| {
+            [l.wqkv, l.wo, l.router].into_iter().chain(l.fc1.iter().copied()).chain(l.fc2.iter().copied())
+        }))
     }
 
     /// Like [`Model::transpose_into`] but only for parameter indices in `r`, writing through
@@ -435,8 +441,20 @@ struct LayerActs {
     attn_w: [Float; N_HEAD * T * T],   // softmax attention weights (causal, lower triangle used)
     attn_out: [Float; T * N_EMBD],     // concatenated head outputs
     x2: [Float; T * N_EMBD],           // x_in + wo(attn_out)      (residual stream after attention)
-    h2: [Float; T * N_EMBD],           // rmsnorm(x2)
-    r: [Float; T * N_HIDDEN],          // relu(fc1(h2))
+    h2: [Float; T * N_EMBD],           // rmsnorm(x2), the experts' input
+    // Mixture of experts. Each position gets TOP_K (position, slot) pairs, each assigned to one
+    // expert. The pairs are grouped by expert so every expert runs as one position-batched
+    // matmul: group row g serves pair grp_pos[g] = i * TOP_K + slot, and expert e owns rows
+    // grp_start[e]..grp_start[e + 1]. For a dense MLP (1 expert, TOP_K 1) the single group is
+    // all positions in order, so this reduces exactly to the plain MLP.
+    router_p: [Float; T * N_EXPERTS],    // softmax of router scores per position
+    sel: [usize; T * TOP_K],             // chosen expert per (position, slot)
+    gate: [Float; T * TOP_K],            // renormalised probability of the chosen expert
+    grp_pos: [usize; T * TOP_K],         // group row -> position * TOP_K + slot
+    grp_start: [usize; N_EXPERTS + 1],   // group rows owned by each expert
+    gath: [Float; T * TOP_K * N_EMBD],   // h2 rows in group order (each expert's input)
+    r: [Float; T * TOP_K * N_HIDDEN],    // relu(fc1_e(h2)) in group order
+    eo: [Float; T * TOP_K * N_EMBD],     // fc2_e(r) in group order, before gating
 }
 
 impl LayerActs {
@@ -448,7 +466,14 @@ impl LayerActs {
             attn_out: [0.0; T * N_EMBD],
             x2: [0.0; T * N_EMBD],
             h2: [0.0; T * N_EMBD],
-            r: [0.0; T * N_HIDDEN],
+            router_p: [0.0; T * N_EXPERTS],
+            sel: [0; T * TOP_K],
+            gate: [0.0; T * TOP_K],
+            grp_pos: [0; T * TOP_K],
+            grp_start: [0; N_EXPERTS + 1],
+            gath: [0.0; T * TOP_K * N_EMBD],
+            r: [0.0; T * TOP_K * N_HIDDEN],
+            eo: [0.0; T * TOP_K * N_EMBD],
         }
     }
 }
@@ -479,7 +504,11 @@ struct Grads {
     dx2: [Float; T * N_EMBD],
     datt: [Float; T * N_EMBD],
     dh: [Float; T * N_EMBD],
-    dr: [Float; T * N_HIDDEN],
+    dr: [Float; T * TOP_K * N_HIDDEN],
+    deo: [Float; T * TOP_K * N_EMBD],  // d loss / d (expert output), group order
+    dhg: [Float; T * TOP_K * N_EMBD],  // d loss / d (expert input), group order
+    dgate: [Float; T * TOP_K],
+    drouter: [Float; T * N_EXPERTS],   // d loss / d router logits
     dqkv: [Float; T * 3 * N_EMBD],
     dlogits: Vec<Float>, // [T][V]
     dx0: [Float; N_EMBD],
@@ -492,7 +521,11 @@ impl Grads {
             dx2: [0.0; T * N_EMBD],
             datt: [0.0; T * N_EMBD],
             dh: [0.0; T * N_EMBD],
-            dr: [0.0; T * N_HIDDEN],
+            dr: [0.0; T * TOP_K * N_HIDDEN],
+            deo: [0.0; T * TOP_K * N_EMBD],
+            dhg: [0.0; T * TOP_K * N_EMBD],
+            dgate: [0.0; T * TOP_K],
+            drouter: [0.0; T * N_EXPERTS],
             dqkv: [0.0; T * 3 * N_EMBD],
             dlogits: vec![0.0; T * vocab_size],
             dx0: [0.0; N_EMBD],
@@ -565,26 +598,99 @@ impl Model {
             matmul_ab(&la.attn_out[rows.clone()], n, E, sh.wo.view(pt), E, &mut la.x2[rows.clone()]);
             add_assign(&mut la.x2[rows.clone()], &xs_in[rows.clone()]);
 
-            // 2) MLP block
+            // 2) MLP block (a mixture of experts; one expert with TOP_K = 1 is the dense MLP)
             for i in from..to {
                 rmsnorm(row(&la.x2, i, E), row_mut(&mut la.h2, i, E));
             }
-            let hrows = from * N_HIDDEN..to * N_HIDDEN;
-            matmul_ab(&la.h2[rows.clone()], n, E, sh.fc1.view(pt), N_HIDDEN, &mut la.r[hrows.clone()]);
-            for v in la.r[hrows.clone()].iter_mut() {
-                *v = v.max(0.0);
+            self.route(la, sh, pt, from, to);
+            self.experts_forward(la, sh, pt, from, to);
+            // combine: x_out = x2 + sum over the position's slots of gate * expert output
+            xs_out[rows.clone()].copy_from_slice(&la.x2[rows.clone()]);
+            for g in 0..la.grp_start[N_EXPERTS] {
+                let ps = la.grp_pos[g];
+                let (i, gt) = (ps / TOP_K, la.gate[ps]);
+                let out = row_mut(xs_out, i, E);
+                let eo = &la.eo[g * E..(g + 1) * E];
+                for d in 0..E {
+                    out[d] = gt.mul_add(eo[d], out[d]);
+                }
             }
-            matmul_ab(&la.r[hrows], n, N_HIDDEN, sh.fc2.view(pt), E, &mut xs_out[rows.clone()]);
-            add_assign(&mut xs_out[rows.clone()], &la.x2[rows.clone()]);
         }
 
         let v = self.vocab_size;
         matmul_ab(&a.xs[N_LAYER][rows], n, E, self.lm_head.view(pt), v, &mut a.logits[from * v..to * v]);
     }
 
+    /// Router: softmax the expert scores of each position, keep the TOP_K most probable experts
+    /// and renormalise their probabilities into gates. A dense MLP needs no router.
+    fn route(&self, la: &mut LayerActs, sh: &LayerShapes, pt: &[Float], from: usize, to: usize) {
+        const E: usize = N_EMBD;
+        if !MOE {
+            for i in from..to {
+                la.sel[i] = 0;
+                la.gate[i] = 1.0;
+            }
+            return;
+        }
+        let n = to - from;
+        matmul_ab(&la.h2[from * E..to * E], n, E, sh.router.view(pt), N_EXPERTS, &mut la.router_p[from * N_EXPERTS..to * N_EXPERTS]);
+        for i in from..to {
+            let p = row_mut(&mut la.router_p, i, N_EXPERTS);
+            softmax_inplace(p);
+            let mut chosen = [usize::MAX; TOP_K];
+            for slot in 0..TOP_K {
+                let mut best = (usize::MAX, -1.0 as Float);
+                for e in 0..N_EXPERTS {
+                    if !chosen[..slot].contains(&e) && p[e] > best.1 {
+                        best = (e, p[e]);
+                    }
+                }
+                chosen[slot] = best.0;
+            }
+            let sum: Float = chosen.iter().map(|&e| p[e]).sum();
+            for slot in 0..TOP_K {
+                la.sel[i * TOP_K + slot] = chosen[slot];
+                la.gate[i * TOP_K + slot] = p[chosen[slot]] / sum;
+            }
+        }
+    }
+
+    /// Group the (position, slot) pairs of `from..to` by expert, gather each expert's inputs, and
+    /// run every expert as one position-batched matmul (dispatch and combine, minus the combine).
+    fn experts_forward(&self, la: &mut LayerActs, sh: &LayerShapes, pt: &[Float], from: usize, to: usize) {
+        const E: usize = N_EMBD;
+        const H: usize = N_HIDDEN;
+        let mut g = 0;
+        for e in 0..N_EXPERTS {
+            la.grp_start[e] = g;
+            for i in from..to {
+                for slot in 0..TOP_K {
+                    if la.sel[i * TOP_K + slot] == e {
+                        la.grp_pos[g] = i * TOP_K + slot;
+                        la.gath[g * E..(g + 1) * E].copy_from_slice(row(&la.h2, i, E));
+                        g += 1;
+                    }
+                }
+            }
+        }
+        la.grp_start[N_EXPERTS] = g;
+        for e in 0..N_EXPERTS {
+            let (a, b) = (la.grp_start[e], la.grp_start[e + 1]);
+            if a == b {
+                continue;
+            }
+            let m = b - a;
+            matmul_ab(&la.gath[a * E..b * E], m, E, sh.fc1[e].view(pt), H, &mut la.r[a * H..b * H]);
+            for v in la.r[a * H..b * H].iter_mut() {
+                *v = v.max(0.0);
+            }
+            matmul_ab(&la.r[a * H..b * H], m, H, sh.fc2[e].view(pt), E, &mut la.eo[a * E..b * E]);
+        }
+    }
+
     /// Softmax the first `n` logit rows into `probs` and return the mean cross-entropy loss
     /// against `targets[i] = tokens[i + 1]`.
-    fn loss(&self, tokens: &[usize], n: usize, a: &mut Acts) -> Float {
+    fn loss_ce(&self, tokens: &[usize], n: usize, a: &mut Acts) -> Float {
         let v = self.vocab_size;
         let mut loss = 0.0;
         for i in 0..n {
@@ -594,6 +700,31 @@ impl Model {
             loss -= probs[tokens[i + 1]].ln();
         }
         loss / n as Float
+    }
+
+    /// Expert load-balancing loss for one document (Switch Transformer style, per sequence):
+    /// coef * N * sum_e f_e * P_e, with f_e the fraction of (position, slot) pairs routed to
+    /// expert e and P_e its mean router probability. It is smallest when routing is even, and
+    /// its gradient (through P_e only) pushes the router away from experts it overuses. Without
+    /// it, the expert that starts best attracts every token and the others never learn.
+    fn aux_loss(&self, a: &Acts, n: usize) -> Float {
+        if !MOE {
+            return 0.0;
+        }
+        let mut total = 0.0;
+        for la in &a.layers {
+            for e in 0..N_EXPERTS {
+                let f_e = (la.grp_start[e + 1] - la.grp_start[e]) as Float / (n * TOP_K) as Float;
+                let p_e = (0..n).map(|i| la.router_p[i * N_EXPERTS + e]).sum::<Float>() / n as Float;
+                total += f_e * p_e;
+            }
+        }
+        AUX_LOSS_COEF * N_EXPERTS as Float * total
+    }
+
+    /// The training loss: cross-entropy plus, for a mixture of experts, the balancing loss.
+    fn loss(&self, tokens: &[usize], n: usize, a: &mut Acts) -> Float {
+        self.loss_ce(tokens, n, a) + self.aux_loss(a, n)
     }
 
     // -----------------------------------------------------------------------------------------
@@ -628,21 +759,85 @@ impl Model {
             let x_in = &a.xs[l][..n * E];
             let dx = &mut s.dx[..n * E];
 
-            // MLP block: x_out = x2 + fc2(relu(fc1(rmsnorm(x2))));  dx holds d/dx_out
-            let r = &la.r[..n * H];
-            matmul_atb_acc(dx, n, E, r, H, sh.fc2.view_mut(g));
-            let dr = &mut s.dr[..n * H];
-            dr.fill(0.0);
-            matmul_ab_acc(dx, n, E, sh.fc2.view(p), H, dr);
-            for (d, &rv) in dr.iter_mut().zip(r) {
-                if rv <= 0.0 {
-                    *d = 0.0;
+            // MLP / mixture-of-experts block: x_out = x2 + sum_slot gate * expert(rmsnorm(x2));
+            // dx holds d/dx_out. Work in group order, one expert at a time.
+            let n_rows = la.grp_start[N_EXPERTS];
+            let deo = &mut s.deo[..n_rows * E];
+            for gr in 0..n_rows {
+                let ps = la.grp_pos[gr];
+                let (i, gt) = (ps / TOP_K, la.gate[ps]);
+                let dxi = row(dx, i, E);
+                let eo = &la.eo[gr * E..(gr + 1) * E];
+                let d = &mut deo[gr * E..(gr + 1) * E];
+                for k in 0..E {
+                    d[k] = gt * dxi[k];
                 }
+                s.dgate[ps] = dot(dxi, eo);
             }
-            matmul_atb_acc(dr, n, H, &la.h2[..n * E], E, sh.fc1.view_mut(g));
+            let dhg = &mut s.dhg[..n_rows * E];
+            for e in 0..N_EXPERTS {
+                let (a0, b0) = (la.grp_start[e], la.grp_start[e + 1]);
+                if a0 == b0 {
+                    continue;
+                }
+                let m = b0 - a0;
+                let r = &la.r[a0 * H..b0 * H];
+                let deo_e = &deo[a0 * E..b0 * E];
+                matmul_atb_acc(deo_e, m, E, r, H, sh.fc2[e].view_mut(g));
+                let dr = &mut s.dr[a0 * H..b0 * H];
+                dr.fill(0.0);
+                matmul_ab_acc(deo_e, m, E, sh.fc2[e].view(p), H, dr);
+                for (d, &rv) in dr.iter_mut().zip(r) {
+                    if rv <= 0.0 {
+                        *d = 0.0;
+                    }
+                }
+                matmul_atb_acc(dr, m, H, &la.gath[a0 * E..b0 * E], E, sh.fc1[e].view_mut(g));
+                let dhg_e = &mut dhg[a0 * E..b0 * E];
+                dhg_e.fill(0.0);
+                matmul_ab_acc(dr, m, H, sh.fc1[e].view(p), E, dhg_e);
+            }
+            // scatter-add each expert's input gradient back to its position
             let dh = &mut s.dh[..n * E];
             dh.fill(0.0);
-            matmul_ab_acc(dr, n, H, sh.fc1.view(p), E, dh);
+            for gr in 0..n_rows {
+                let i = la.grp_pos[gr] / TOP_K;
+                add_assign(row_mut(dh, i, E), &dhg[gr * E..(gr + 1) * E]);
+            }
+            if MOE {
+                // gates: gate_s = p_s / S over the chosen experts, so for a chosen t
+                // dp_t = (dgate_t - sum_s dgate_s * gate_s) / S; the balancing loss adds
+                // coef * N * f_e / n to every dp_e; then softmax backward to the router logits.
+                let mut f = [0.0 as Float; N_EXPERTS];
+                for e in 0..N_EXPERTS {
+                    f[e] = (la.grp_start[e + 1] - la.grp_start[e]) as Float / (n * TOP_K) as Float;
+                }
+                let dl = &mut s.drouter[..n * N_EXPERTS];
+                for i in 0..n {
+                    let pr = row(&la.router_p, i, N_EXPERTS);
+                    let mut dp = [0.0 as Float; N_EXPERTS];
+                    for e in 0..N_EXPERTS {
+                        dp[e] = AUX_LOSS_COEF * N_EXPERTS as Float * f[e] / n as Float;
+                    }
+                    let mut ssum = 0.0;
+                    let mut dot_dg = 0.0;
+                    for slot in 0..TOP_K {
+                        let ps = i * TOP_K + slot;
+                        ssum += pr[la.sel[ps]];
+                        dot_dg += s.dgate[ps] * la.gate[ps];
+                    }
+                    for slot in 0..TOP_K {
+                        let ps = i * TOP_K + slot;
+                        dp[la.sel[ps]] += (s.dgate[ps] - dot_dg) / ssum;
+                    }
+                    let dpp: Float = (0..N_EXPERTS).map(|e| dp[e] * pr[e]).sum();
+                    for e in 0..N_EXPERTS {
+                        dl[i * N_EXPERTS + e] = pr[e] * (dp[e] - dpp);
+                    }
+                }
+                matmul_atb_acc(dl, n, N_EXPERTS, &la.h2[..n * E], E, sh.router.view_mut(g));
+                matmul_ab_acc(dl, n, N_EXPERTS, sh.router.view(p), E, dh);
+            }
             let dx2 = &mut s.dx2[..n * E];
             dx2.copy_from_slice(dx);
             for i in 0..n {
@@ -732,9 +927,29 @@ impl Model {
             data.tokenize(doc, tokens);
             let n = (tokens.len() - 1).min(BLOCK_SIZE);
             self.forward(p, &pt, tokens, 0, n, acts);
-            total += self.loss(tokens, n, acts);
+            total += self.loss_ce(tokens, n, acts);
         }
         total / docs.len() as Float
+    }
+
+    /// Per layer, the fraction of (position, slot) pairs of `docs` routed to each expert.
+    fn expert_usage(&self, p: &[Float], data: &Dataset, docs: &[String], acts: &mut Acts, tokens: &mut Vec<usize>) -> Vec<[Float; N_EXPERTS]> {
+        let mut pt = vec![0.0 as Float; p.len()];
+        self.transpose_into(p, &mut pt);
+        let mut counts = [[0usize; N_EXPERTS]; N_LAYER];
+        let mut total = 0usize;
+        for doc in docs {
+            data.tokenize(doc, tokens);
+            let n = (tokens.len() - 1).min(BLOCK_SIZE);
+            self.forward(p, &pt, tokens, 0, n, acts);
+            for (l, la) in acts.layers.iter().enumerate() {
+                for e in 0..N_EXPERTS {
+                    counts[l][e] += la.grp_start[e + 1] - la.grp_start[e];
+                }
+            }
+            total += n * TOP_K;
+        }
+        counts.iter().map(|c| std::array::from_fn(|e| c[e] as Float / total.max(1) as Float)).collect()
     }
 }
 
@@ -1227,7 +1442,11 @@ fn main() -> io::Result<()> {
 
     let model = Model::new(data.vocab_size());
     let mut params = model.init_params(&mut rng);
-    println!("model: {N_LAYER} layer(s), n_embd {N_EMBD}, {N_HEAD} heads, block size {BLOCK_SIZE} | num params: {}", model.n_params);
+    println!(
+        "model: {N_LAYER} layer(s), n_embd {N_EMBD}, {N_HEAD} heads, block size {BLOCK_SIZE}, {} | num params: {}",
+        if MOE { format!("{N_EXPERTS} experts of width {N_HIDDEN}, top-{TOP_K}") } else { format!("dense MLP of width {N_HIDDEN}") },
+        model.n_params
+    );
     println!(
         "steps: {} | batch size: {} | threads: {} | lr: {} | seed: {}",
         cfg.num_steps,
@@ -1255,6 +1474,12 @@ fn main() -> io::Result<()> {
     let mut tokens = Vec::with_capacity(BLOCK_SIZE + 2);
     let held_out = model.eval_loss(&params, &data, data.eval_docs(), &mut acts, &mut tokens);
     writeln!(out, "held-out loss {held_out:.4} (mean over {} names never trained on)", data.eval_docs().len())?;
+    if MOE {
+        for (l, usage) in model.expert_usage(&params, &data, data.eval_docs(), &mut acts, &mut tokens).iter().enumerate() {
+            let pct: Vec<String> = usage.iter().map(|u| format!("{:.0}%", 100.0 * u)).collect();
+            writeln!(out, "layer {l} expert usage on held-out names: {}", pct.join(" / "))?;
+        }
+    }
 
     // Inference: may the model babble back to us
     writeln!(out, "--- inference (new, hallucinated names) ---")?;
@@ -1326,18 +1551,27 @@ mod tests {
         let n = (tokens.len() - 1).min(BLOCK_SIZE);
 
         full_loss(&model, &params, &tokens, n, &mut acts);
+        let selections = |acts: &Acts| -> Vec<usize> { acts.layers.iter().flat_map(|la| la.sel[..n * TOP_K].to_vec()).collect() };
+        let base_sel = selections(&acts);
         model.backward(&params, &mut grads, &tokens, n, &acts, &mut scratch);
 
         let h = 1e-5;
         let mut checked = 0;
+        let mut skipped = 0;
         let mut max_rel = 0.0f64;
         for idx in (0..model.n_params).step_by(7) {
             let orig = params[idx];
             params[idx] = orig + h;
             let lp = full_loss(&model, &params, &tokens, n, &mut acts);
+            let sel_p = selections(&acts);
             params[idx] = orig - h;
             let lm = full_loss(&model, &params, &tokens, n, &mut acts);
+            let sel_m = selections(&acts);
             params[idx] = orig;
+            if sel_p != base_sel || sel_m != base_sel {
+                skipped += 1; // top-k routing flipped: the loss is not differentiable there
+                continue;
+            }
             let numeric = (lp - lm) / (2.0 * h);
             let analytic = grads[idx];
             let denom = numeric.abs().max(analytic.abs()).max(1e-6);
@@ -1352,7 +1586,7 @@ mod tests {
             }
         }
         assert!(checked > 300, "too few non-zero gradients checked: {checked}");
-        eprintln!("checked {checked} params, max relative error {max_rel:.2e}");
+        eprintln!("checked {checked} params ({skipped} skipped for routing flips), max relative error {max_rel:.2e}");
     }
 
     #[test]

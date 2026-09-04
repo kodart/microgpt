@@ -17,7 +17,8 @@ The model shape is fixed at build time (the activation buffers are fixed-size ar
 gist's values as defaults. Override with environment variables when building:
 
 ```bash
-MICROGPT_N_EMBD=32 MICROGPT_N_LAYER=2 cargo build --release   # also MICROGPT_N_HEAD, MICROGPT_BLOCK_SIZE
+MICROGPT_N_EMBD=32 MICROGPT_N_LAYER=2 cargo build --release            # also MICROGPT_N_HEAD, MICROGPT_BLOCK_SIZE
+MICROGPT_N_EXPERTS=8 MICROGPT_TOP_K=2 MICROGPT_HIDDEN=32 cargo build --release   # mixture of experts
 ```
 
 ## Run
@@ -103,6 +104,47 @@ buy up to a few seconds and saturates near 2.055; the 2-layer 32-dim model keeps
 wins once you can afford eight seconds or more. Per-step costs at 16 x 4: 43 us (16-dim),
 74 us (2 x 16), 120 us (32-dim), 211 us (2 x 32). The build defaults stay at the gist's shape so
 the numbers above remain reproducible; pick a larger one with the build variables.
+
+### Mixture of experts
+
+The MLP of each block can be a mixture of experts, as in GLM, DeepSeek and Mixtral: `N_EXPERTS`
+MLPs of hidden width `N_HIDDEN`, and a router (a `N_EXPERTS x n_embd` matrix) that scores them
+per position. The `TOP_K` most probable experts run, their outputs are mixed with the
+renormalised router probabilities as gates, and the result is added to the residual stream.
+Parameters grow with the number of experts; compute per token only with `TOP_K x N_HIDDEN`.
+The dense model is the one-expert, top-1 case and is bit-for-bit unchanged.
+
+How it is implemented: the (position, slot) pairs of a document are grouped by expert, each
+expert's inputs are gathered into a contiguous buffer, and every expert runs as one
+position-batched matmul (the same kernels as the dense path). The backward pass mirrors that:
+gradients reach the chosen experts scaled by their gate, the gate gradient `dx . expert_output`
+flows through the renormalisation and the softmax to the router, and unchosen experts get
+nothing. Because unchosen experts never learn, a Switch-Transformer-style balancing loss
+`0.01 * N * sum_e f_e * P_e` is added per document (`f_e` = fraction of pairs routed to `e`,
+`P_e` = mean router probability); its gradient pushes the router away from experts it overuses.
+The training loss includes it; the reported held-out loss is plain cross-entropy. Runs print
+the held-out expert usage per layer. The f64 gradient check covers the router and experts,
+skipping parameters whose perturbation flips a top-k choice (the loss is not differentiable there).
+
+Held-out loss, 1 layer, 16-dim, 4 threads, 20000 steps:
+
+| MLP | params | 16 x 4 | 64 x 4 | µs/step at 16 x 4 |
+|---|---|---|---|---|
+| dense, width 64 | 4,192 | 2.123 | 2.104 | 43 |
+| 4 experts of 32, top-1 | 6,304 | 2.156 | 2.136 | 43 |
+| 4 experts of 32, top-2 | 6,304 | 2.114 | 2.089 | 50 |
+| 8 experts of 32, top-2 | 10,496 | 2.106 | 2.073 | 60 |
+| 4 experts of 64, top-2 | 10,400 | 2.096 | 2.077 | 71 |
+| 8 experts of 64, top-2 | 18,688 | 2.100 | **2.049** | 84 |
+
+Top-2 with the same per-token compute as the dense MLP (4 experts of 32) already beats it, and
+8 experts of 64 at 64 x 4 reaches 2.049 in 5.6 s, better and faster than the 32-dim dense model
+(2.053 in 7.9 s). Top-1 is worse than dense: each token then gets a 32-wide expert instead of a
+64-wide MLP, and with one gate there is no gate gradient to teach the router. Usage stays within
+a few percent of even with the balancing loss on. Without it (coefficient 0) routing goes lopsided
+rather than collapsing: 44/9/8/40% for 4 experts, and with 8 experts two of them end up at 0% and
+3%; the held-out loss is the same at 4 experts (2.121 vs 2.114 at 16 x 4, 2.087 vs 2.089 at
+64 x 4) and slightly worse at 8 (2.080 vs 2.073).
 
 ### Findings from the sweeps (held-out loss, 4 threads unless noted)
 

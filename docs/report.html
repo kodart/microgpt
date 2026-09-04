@@ -196,11 +196,31 @@
   </section>
 
   <section>
-    <div class="eyebrow">06 · Recommendations</div>
+    <div class="eyebrow">06 · Mixture of experts</div>
+    <h2>More parameters per token of compute</h2>
+    <p>The MLP of the block can be a mixture of experts, the structure GLM, DeepSeek and Mixtral use: several MLPs ("experts") and a router, a tiny <code>N_EXPERTS x 16</code> matrix, that scores them per position. The top-k experts run, their outputs are mixed with the renormalised router probabilities as gates, and the sum joins the residual stream. Parameters grow with the expert count; compute per token grows only with <code>k x width</code>. The dense model is the one-expert, top-1 case and is bit-for-bit unchanged.</p>
+    <p>Implementation: the (position, slot) pairs of a name are grouped by expert, each expert's inputs are gathered into a contiguous buffer, and every expert runs as one position-batched matmul with the same kernels as the dense path. The backward pass mirrors it: chosen experts get gradients scaled by their gate, the gate gradient <code>dx · expert_output</code> flows through the renormalisation and softmax into the router, unchosen experts get nothing. Because unchosen experts never learn, a per-name balancing loss (Switch Transformer style, coefficient 0.01) pushes the router away from experts it overuses. The f64 gradient check covers router and experts, skipping parameters whose perturbation flips a top-k choice.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>MLP (1 layer, 16-dim)</th><th class="num">Params</th><th class="num">16 x 4, 20000 steps</th><th class="num">64 x 4, 20000 steps</th><th class="num">µs/step at 16 x 4</th></tr></thead>
+      <tbody>
+        <tr><td>dense, width 64</td><td class="num">4,192</td><td class="num">2.123</td><td class="num">2.104</td><td class="num">43</td></tr>
+        <tr><td>4 experts of 32, top-1</td><td class="num">6,304</td><td class="num">2.156</td><td class="num">2.136</td><td class="num">43</td></tr>
+        <tr><td>4 experts of 32, top-2</td><td class="num">6,304</td><td class="num">2.114</td><td class="num">2.089</td><td class="num">50</td></tr>
+        <tr><td>8 experts of 32, top-2</td><td class="num">10,496</td><td class="num">2.106</td><td class="num">2.073</td><td class="num">60</td></tr>
+        <tr><td>4 experts of 64, top-2</td><td class="num">10,400</td><td class="num">2.096</td><td class="num">2.077</td><td class="num">71</td></tr>
+        <tr><td>8 experts of 64, top-2</td><td class="num">18,688</td><td class="num">2.100</td><td class="num"><strong>2.049</strong></td><td class="num">84</td></tr>
+      </tbody>
+    </table></div>
+    <p>Three readings. Top-2 at the dense model's per-token compute (4 experts of 32) already beats it by 0.01 to 0.015, above the noise floor. More and wider experts keep helping when there is data to feed them: 8 experts of 64 at 64 x 4 reaches 2.049 in 5.6 s, better and faster than the 32-dim dense single layer (2.053 in 7.9 s), which is the whole promise of the architecture in miniature. And top-1 is worse than dense: each token then gets a 32-wide expert instead of a 64-wide MLP, and with a single gate there is no gate gradient to teach the router. Held-out expert usage stayed within a few percent of even in every top-2 run. Switching the balancing loss off was measured too: routing goes lopsided rather than collapsing (44/9/8/40% with 4 experts; with 8, two experts end at 0% and 3%), the loss is unchanged at 4 experts and about 0.007 worse at 8. At this scale the balancing term is cheap insurance rather than a necessity.</p>
+    <p class="note">Expert usage is printed per layer at the end of every mixture-of-experts run. Build with <code>MICROGPT_N_EXPERTS=8 MICROGPT_TOP_K=2 MICROGPT_HIDDEN=64 cargo build --release</code>.</p>
+  </section>
+
+  <section>
+    <div class="eyebrow">07 · Recommendations</div>
     <h2>What to run</h2>
     <div class="callout">
       <p><strong>Want under a second of training:</strong> the 32-dim single layer at 6700 x 16 on 4 threads reaches 2.107 in 0.8 s, better than the gist's shape gets in any amount of time at this recipe.</p>
-      <p><strong>Want the lowest loss:</strong> the 2-layer 32-dim model at 64 names per step, 4 threads. 2.026 in 7.5 s, and still improving with more steps.</p>
+      <p><strong>Want the lowest loss:</strong> the 2-layer 32-dim model at 64 names per step, 4 threads. 2.026 in 7.5 s, and still improving with more steps. <strong>Want the best loss per second:</strong> a 16-dim layer with 8 experts of 64, top-2, at 64 x 4: 2.049 in 5.6 s.</p>
       <p><strong>Leave the learning rate at 0.01</strong> for any batched run; lower it to 0.005 only for the one-name recipe. Use 6 threads instead of 4 when nothing else is running.</p>
     </div>
     <h3>Not worth pursuing</h3>
@@ -213,12 +233,12 @@
   </section>
 
   <section>
-    <div class="eyebrow">07 · Method</div>
+    <div class="eyebrow">08 · Method</div>
     <h2>How the numbers were taken</h2>
     <ul>
       <li><strong>Held-out loss</strong> is the mean cross-entropy over the last 1,000 names of the seed-42 shuffle, which are never trained on. Every configuration is scored on the same names. Training-batch losses are not compared across batch sizes.</li>
       <li><strong>Timing</strong> is training wall-clock only, and every number on this page was re-measured with the final code (commit history in the repo records the intermediate builds). Loss logging snapshots the parameters (16 KB) during training and evaluates them afterwards; an earlier inline evaluator slowed the 8-thread run by 75% by disturbing the worker scheduling and was replaced.</li>
-      <li><strong>Correctness</strong> rests on an f64 finite-difference gradient check over a few hundred parameters (max relative error under 1e-4, run for all four model shapes), an incremental-versus-full forward equivalence test for the KV cache, and a check that 1-thread and 3-thread training produce the same parameters to 1e-9.</li>
+      <li><strong>Correctness</strong> rests on an f64 finite-difference gradient check over a few hundred parameters (max relative error under 1e-4, run for all four model shapes and for the mixture-of-experts build), an incremental-versus-full forward equivalence test for the KV cache, and a check that 1-thread and 3-thread training produce the same parameters to 1e-9.</li>
       <li><strong>Machine:</strong> Apple M1 Pro, 8 performance + 2 efficiency cores, Rust 1.97 stable. The Python baseline is CPython 3 on the same laptop. The RNG is xoshiro256** and does not reproduce Python's stream, so exact losses differ from the gist.</li>
       <li><strong>Code:</strong> <code>src/main.rs</code> (about 1,200 lines including tests), <code>build.rs</code> for the model shape, <code>docs/loss-curves.html</code> and <code>docs/loss-logs/</code> for the recorded runs.</li>
     </ul>
