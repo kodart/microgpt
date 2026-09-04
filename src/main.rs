@@ -1176,7 +1176,7 @@ mod tests {
         let mut rng = Rng::new(42);
         let model = Model::new(data.vocab_size());
         let init = model.init_params(&mut rng);
-        let mut run = |n_threads: usize| {
+        let run = |n_threads: usize| {
             let mut params = init.clone();
             let cfg = TrainConfig { num_steps: 30, batch_size: 5, n_threads, log_path: None, eval_every: 100, lr: LEARNING_RATE };
             let loss = train(&model, &data, &mut params, &cfg, &mut io::sink()).unwrap();

@@ -20,7 +20,7 @@ fn main() {
     let n_head = knob("MICROGPT_N_HEAD", 4);
     let block_size = knob("MICROGPT_BLOCK_SIZE", 16);
     assert!(n_layer >= 1 && n_embd >= 1 && n_head >= 1 && block_size >= 1, "model dimensions must be >= 1");
-    assert!(n_embd % n_head == 0, "MICROGPT_N_EMBD ({n_embd}) must be a multiple of MICROGPT_N_HEAD ({n_head})");
+    assert!(n_embd.is_multiple_of(n_head), "MICROGPT_N_EMBD ({n_embd}) must be a multiple of MICROGPT_N_HEAD ({n_head})");
     let out = Path::new(&env::var("OUT_DIR").unwrap()).join("model_config.rs");
     fs::write(
         out,
