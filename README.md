@@ -40,7 +40,16 @@ a step is tens of microseconds, so parking threads on channels or condvars would
 the compute. Nothing allocates in steady state. Because which worker sums which document varies,
 multi-threaded results are deterministic only up to floating-point summation order.
 
-## Loss curves
+## Loss curves and experiments
+
+Knobs, all environment variables so the positional arguments stay `[num_steps] [batch_size] [threads]`:
+
+| variable | default | effect |
+|---|---|---|
+| `MICROGPT_LOG` | unset | write `step,train_time_s,train_loss,eval_loss` to this CSV |
+| `MICROGPT_EVAL_EVERY` | 100 | log interval in steps |
+| `MICROGPT_LR` | 0.01 | peak learning rate (decays linearly to zero) |
+| `MICROGPT_SEED` | unset | reseed before parameter init; the data shuffle and held-out split always use seed 42, so losses stay comparable across seeds |
 
 Set `MICROGPT_LOG=<file.csv>` to record `step,train_time_s,train_loss,eval_loss` every
 `MICROGPT_EVAL_EVERY` steps (default 100). The last 1000 names of the shuffled dataset are held
@@ -58,6 +67,21 @@ about 4-6x sooner than the single-name recipe and end between 2.11 (64 x 4, 3.7 
 batches keep buying a little loss for proportionally more time; 16 x 4 is the default because it
 has the best loss per second, and 4 threads are far less sensitive to other processes using
 cores than 8.
+
+### Findings from the sweeps (held-out loss, 4 threads unless noted)
+
+- **Seed noise:** four seeds of `20000 16 4` end at 2.120-2.130, so differences under ~0.01 are noise.
+- **Learning rate:** 0.01 is already at the optimum for batched Adam here (`16 x 4`: 0.0025 -> 2.135,
+  0.005 -> 2.119, 0.01 -> 2.122, 0.02 -> 2.162; `64 x 4`: 0.005 -> 2.107, 0.01 -> 2.105, 0.02 -> 2.124).
+  Larger batches do not want a larger rate. The single-name recipe prefers a lower one
+  (`20000 1 1` at 0.005 -> 2.203 versus 2.223 at 0.01).
+- **Batch size at equal data (640k names):** 8 -> 2.139, 16 -> 2.130, 32 -> 2.119, 64 -> 2.108,
+  128 -> 2.109. Larger batches are better per name up to 64 and flat after; with this tiny model
+  the noise of small batches costs more than the extra updates gain.
+- **Threads:** on a quiet machine 6 threads are ~20% faster than 4 (`20000 32 x`: 1.95 s -> 1.52 s;
+  `20000 16 x`: 1.10 s -> 0.92 s), but any background load (a browser, Gatekeeper scanning new
+  binaries) turned the same 6-thread runs into 3-8 s while 4-thread runs stayed near 1.1 s. The
+  default stays at 4; pass 6 explicitly on a quiet machine.
 
 ## What was optimised
 

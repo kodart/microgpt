@@ -749,6 +749,8 @@ struct TrainConfig {
     /// (a 16 KB copy) and evaluated after it ends, so logging does not perturb the timings.
     log_path: Option<String>,
     eval_every: usize,
+    /// Peak learning rate; decays linearly to zero over `num_steps`.
+    lr: Float,
 }
 
 /// Per-worker mailbox. Locks are only ever taken uncontended (main and worker alternate strictly).
@@ -915,7 +917,7 @@ fn train(model: &Model, data: &Dataset, params: &mut Vec<Float>, cfg: &TrainConf
             }
             loss = loss_sum * inv_b;
 
-            let lr_t = LEARNING_RATE * (1.0 - step as Float / num_steps as Float); // linear decay
+            let lr_t = cfg.lr * (1.0 - step as Float / num_steps as Float); // linear decay
             adam.step(&mut shared.params.write().unwrap(), &mut grads, lr_t, step + 1);
 
             if logging {
@@ -977,17 +979,33 @@ fn main() -> io::Result<()> {
         n_threads: args.next().unwrap_or_else(default_threads),
         log_path: std::env::var("MICROGPT_LOG").ok(),
         eval_every: std::env::var("MICROGPT_EVAL_EVERY").ok().and_then(|s| s.parse().ok()).unwrap_or(100),
+        lr: std::env::var("MICROGPT_LR").ok().and_then(|s| s.parse().ok()).unwrap_or(LEARNING_RATE),
     };
     let mut rng = Rng::new(42); // let there be order among chaos
 
+    // The dataset is always shuffled with seed 42, so the held-out split and the training order
+    // are the same for every run. MICROGPT_SEED reseeds the generator after that, i.e. it changes
+    // the parameter initialisation and the sampling, which keeps held-out losses comparable
+    // between seeds. Unset, the single seed-42 stream continues as in the gist.
     let data = Dataset::load("input.txt", &mut rng)?;
+    let seed: Option<u64> = std::env::var("MICROGPT_SEED").ok().map(|s| s.parse().expect("MICROGPT_SEED must be an integer"));
+    if let Some(seed) = seed {
+        rng = Rng::new(seed);
+    }
     println!("num docs: {} ({} train, {} held out)", data.docs.len(), data.n_train, data.eval_docs().len());
     println!("vocab size: {}", data.vocab_size());
 
     let model = Model::new(data.vocab_size());
     let mut params = model.init_params(&mut rng);
     println!("num params: {}", model.n_params);
-    println!("steps: {} | batch size: {} | threads: {}", cfg.num_steps, cfg.batch_size, cfg.n_threads.clamp(1, cfg.batch_size.max(1)));
+    println!(
+        "steps: {} | batch size: {} | threads: {} | lr: {} | seed: {}",
+        cfg.num_steps,
+        cfg.batch_size,
+        cfg.n_threads.clamp(1, cfg.batch_size.max(1)),
+        cfg.lr,
+        seed.map_or("42 (default)".to_string(), |s| s.to_string())
+    );
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -1158,7 +1176,7 @@ mod tests {
         let init = model.init_params(&mut rng);
         let mut run = |n_threads: usize| {
             let mut params = init.clone();
-            let cfg = TrainConfig { num_steps: 30, batch_size: 5, n_threads, log_path: None, eval_every: 100 };
+            let cfg = TrainConfig { num_steps: 30, batch_size: 5, n_threads, log_path: None, eval_every: 100, lr: LEARNING_RATE };
             let loss = train(&model, &data, &mut params, &cfg, &mut io::sink()).unwrap();
             (loss, params)
         };
