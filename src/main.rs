@@ -1136,6 +1136,7 @@ impl Schedule {
     }
 }
 
+#[derive(Clone)]
 struct TrainConfig {
     num_steps: usize,
     batch_size: usize,
@@ -1467,6 +1468,206 @@ fn train(model: &Model, data: &Dataset, params: &mut Vec<Float>, cfg: &TrainConf
 }
 
 // ---------------------------------------------------------------------------------------------
+// Pruning study: remove hidden neurons from a trained model, with and without compensation.
+//
+// A hidden neuron j of an expert is a row of fc1 (its input weights) and a column of fc2 (its
+// contribution to the output). Removing it deletes fc2[:, j] * relu(fc1[j] . h) from the output.
+// The question is how to choose j and what to do with the remaining neurons. Three answers:
+//
+//  * magnitude:  drop the neurons with the smallest ||fc1[j]|| * ||fc2[:, j]||, change nothing;
+//  * activation: drop the neurons with the smallest ||fc2[:, j]||^2 * E[r_j^2], change nothing;
+//  * OBS:        Optimal Brain Surgeon on the layer's own reconstruction problem. With R the
+//                hidden activations over a data sample, choose the pruned fc2' minimising
+//                ||fc2 R - fc2' R||^2. That quadratic has Hessian G = R R^T (plus a little damping),
+//                so removing column j costs ||fc2[:, j]||^2 / [G^-1]_jj and the other columns are
+//                compensated by fc2[i, :] -= fc2[i, j] / [G^-1]_jj * G^-1[j, :]; then G^-1 loses
+//                row/column j through its Schur complement. Repeat for the next cheapest neuron.
+//
+// The study prunes the neurons in place by zeroing their fc1 row and fc2 column (a dead neuron
+// stays dead under further training, since relu(0) = 0 kills both its gradients), evaluates the
+// held-out loss after each method at several pruning levels, and optionally fine-tunes the
+// OBS-pruned model for a few steps. Enabled with MICROGPT_PRUNE=1 (or a list of neuron counts).
+// ---------------------------------------------------------------------------------------------
+
+/// In-place Gauss-Jordan inverse of an n x n row-major matrix with partial pivoting.
+fn invert_f64(a: &mut [f64], n: usize) {
+    let mut inv = vec![0.0; n * n];
+    for i in 0..n {
+        inv[i * n + i] = 1.0;
+    }
+    for c in 0..n {
+        let piv = (c..n).max_by(|&x, &y| a[x * n + c].abs().partial_cmp(&a[y * n + c].abs()).unwrap()).unwrap();
+        if piv != c {
+            for k in 0..n {
+                a.swap(c * n + k, piv * n + k);
+                inv.swap(c * n + k, piv * n + k);
+            }
+        }
+        let d = a[c * n + c];
+        assert!(d.abs() > 1e-300, "singular matrix in pruning study");
+        for k in 0..n {
+            a[c * n + k] /= d;
+            inv[c * n + k] /= d;
+        }
+        for r in 0..n {
+            if r != c {
+                let f = a[r * n + c];
+                if f != 0.0 {
+                    for k in 0..n {
+                        a[r * n + k] -= f * a[c * n + k];
+                        inv[r * n + k] -= f * inv[c * n + k];
+                    }
+                }
+            }
+        }
+    }
+    a.copy_from_slice(&inv);
+}
+
+/// Hessian G = R R^T / M of every expert's fc2 reconstruction problem (per layer, per expert),
+/// from the hidden activations R over the first `n_docs` training names.
+#[allow(clippy::unnecessary_cast)] // Float is f64 in test builds
+fn hidden_hessians(model: &Model, data: &Dataset, p: &[Float], n_docs: usize) -> Vec<Vec<Vec<f64>>> {
+    const H: usize = N_HIDDEN;
+    let mut pt = vec![0.0 as Float; p.len()];
+    model.transpose_into(p, &mut pt);
+    let mut acts = Acts::new(model.vocab_size);
+    let mut tokens = Vec::with_capacity(BLOCK_SIZE + 2);
+    let mut g = vec![vec![vec![0.0f64; H * H]; N_EXPERTS]; N_LAYER];
+    let mut m = vec![vec![0usize; N_EXPERTS]; N_LAYER];
+    for doc in &data.docs[..n_docs.min(data.n_train)] {
+        data.tokenize(doc, &mut tokens);
+        let n = (tokens.len() - 1).min(BLOCK_SIZE);
+        model.forward(p, &pt, &tokens, 0, n, &mut acts);
+        for (l, la) in acts.layers.iter().enumerate() {
+            for e in 0..N_EXPERTS {
+                for gr in la.grp_start[e]..la.grp_start[e + 1] {
+                    let r = &la.r[gr * H..(gr + 1) * H];
+                    let ge = &mut g[l][e];
+                    for a in 0..H {
+                        let ra = r[a] as f64;
+                        if ra != 0.0 {
+                            for b in 0..H {
+                                ge[a * H + b] += ra * r[b] as f64;
+                            }
+                        }
+                    }
+                    m[l][e] += 1;
+                }
+            }
+        }
+    }
+    for l in 0..N_LAYER {
+        for e in 0..N_EXPERTS {
+            let scale = 1.0 / m[l][e].max(1) as f64;
+            for v in g[l][e].iter_mut() {
+                *v *= scale;
+            }
+        }
+    }
+    g
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PruneMethod {
+    Magnitude,
+    Activation,
+    Obs,
+}
+
+/// Remove `k` hidden neurons from every expert of every layer of `p` (in place) by `method`.
+#[allow(clippy::unnecessary_cast)] // Float is f64 in test builds
+fn prune(model: &Model, p: &mut [Float], hess: &[Vec<Vec<f64>>], k: usize, method: PruneMethod) {
+    const E: usize = N_EMBD;
+    const H: usize = N_HIDDEN;
+    for (l, sh) in model.layers.iter().enumerate() {
+        for e in 0..N_EXPERTS {
+            let (t1, t2) = (sh.fc1[e], sh.fc2[e]);
+            // fc2 as f64 [E][H]; damped Hessian and its inverse
+            let mut w: Vec<f64> = t2.view(p).iter().map(|&x| x as f64).collect();
+            let mut ginv = hess[l][e].clone();
+            let damp = 0.01 * (0..H).map(|j| ginv[j * H + j]).sum::<f64>() / H as f64 + 1e-12;
+            for j in 0..H {
+                ginv[j * H + j] += damp;
+            }
+            invert_f64(&mut ginv, H);
+            let mut removed = vec![false; H];
+            for _ in 0..k.min(H) {
+                let score = |j: usize| -> f64 {
+                    let col2: f64 = (0..E).map(|i| w[i * H + j] * w[i * H + j]).sum();
+                    match method {
+                        PruneMethod::Magnitude => {
+                            let row2: f64 = t1.view(p)[j * E..(j + 1) * E].iter().map(|&x| (x as f64) * (x as f64)).sum();
+                            (col2 * row2).sqrt()
+                        }
+                        PruneMethod::Activation => col2 * hess[l][e][j * H + j],
+                        PruneMethod::Obs => col2 / ginv[j * H + j],
+                    }
+                };
+                let j = (0..H).filter(|&j| !removed[j]).min_by(|&a, &b| score(a).partial_cmp(&score(b)).unwrap()).unwrap();
+                removed[j] = true;
+                if method == PruneMethod::Obs {
+                    // compensate the remaining columns, then drop j from the inverse Hessian
+                    let d = ginv[j * H + j];
+                    for i in 0..E {
+                        let c = w[i * H + j] / d;
+                        for b in 0..H {
+                            if !removed[b] {
+                                w[i * H + b] -= c * ginv[j * H + b];
+                            }
+                        }
+                    }
+                    let row: Vec<f64> = ginv[j * H..(j + 1) * H].to_vec();
+                    for a in 0..H {
+                        let ca = ginv[a * H + j] / d;
+                        for b in 0..H {
+                            ginv[a * H + b] -= ca * row[b];
+                        }
+                    }
+                }
+                for i in 0..E {
+                    w[i * H + j] = 0.0;
+                }
+                t1.view_mut(p)[j * E..(j + 1) * E].fill(0.0);
+            }
+            for (dst, &src) in t2.view_mut(p).iter_mut().zip(&w) {
+                *dst = src as Float;
+            }
+        }
+    }
+}
+
+fn prune_study(model: &Model, data: &Dataset, params: &[Float], cfg: &TrainConfig, ks: &[usize], finetune_steps: usize, out: &mut impl Write) -> io::Result<()> {
+    let hess = hidden_hessians(model, data, params, 4000);
+    let mut acts = Acts::new(model.vocab_size);
+    let mut tokens = Vec::with_capacity(BLOCK_SIZE + 2);
+    let base = model.eval_loss(params, data, data.eval_docs(), &mut acts, &mut tokens);
+    // a neuron whose activation is identically zero on the sample (a dead ReLU) has G_jj = 0
+    let dead: usize = hess.iter().flatten().map(|g| (0..N_HIDDEN).filter(|&j| g[j * N_HIDDEN + j] == 0.0).count()).sum();
+    writeln!(
+        out,
+        "--- pruning study: {N_LAYER} layer(s) x {N_EXPERTS} expert(s) x {N_HIDDEN} hidden neurons each; Hessians from 4000 training names; held-out loss before pruning {base:.4}; {dead} neuron(s) never activate"
+    )?;
+    writeln!(out, " removed | magnitude | activation | OBS+compensation | OBS + {finetune_steps}-step fine-tune")?;
+    for &k in ks {
+        let mut cells = Vec::new();
+        for method in [PruneMethod::Magnitude, PruneMethod::Activation, PruneMethod::Obs] {
+            let mut p = params.to_vec();
+            prune(model, &mut p, &hess, k, method);
+            cells.push(model.eval_loss(&p, data, data.eval_docs(), &mut acts, &mut tokens));
+            if method == PruneMethod::Obs && finetune_steps > 0 {
+                let ft = TrainConfig { num_steps: finetune_steps, lr: cfg.lr * 0.2, log_path: None, ..cfg.clone() };
+                train(model, data, &mut p, &ft, &mut io::sink())?;
+                cells.push(model.eval_loss(&p, data, data.eval_docs(), &mut acts, &mut tokens));
+            }
+        }
+        let row: Vec<String> = cells.iter().map(|c| format!("{c:.4}")).collect();
+        writeln!(out, " {k:>7} | {}", row.join(" | "))?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
 // Main: train + sample
 // ---------------------------------------------------------------------------------------------
 
@@ -1568,6 +1769,16 @@ fn main() -> io::Result<()> {
                 }
             }
         }
+    }
+
+    if let Ok(spec) = std::env::var("MICROGPT_PRUNE") {
+        let ks: Vec<usize> = if spec == "1" {
+            [1, 2, 3, 4, 5, 6, 7].iter().map(|f| N_HIDDEN * f / 8).collect()
+        } else {
+            spec.split(',').map(|s| s.trim().parse().expect("MICROGPT_PRUNE must be 1 or a list of neuron counts")).collect()
+        };
+        let finetune = std::env::var("MICROGPT_PRUNE_FINETUNE").ok().and_then(|s| s.parse().ok()).unwrap_or(2000);
+        prune_study(&model, &data, &params, &cfg, &ks, finetune, &mut out)?;
     }
 
     // Inference: may the model babble back to us

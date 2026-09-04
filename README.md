@@ -162,6 +162,53 @@ than one MLP that must serve all of them. The stacked 2-layer, 32-dim, 8-expert 
 76,480 params) reaches 2.024 at 64 x 4 in 17.8 s, only marginally better than the dense 2-layer
 32-dim model's 2.026 in 7.5 s: at 640k names the two capacity gains barely stack.
 
+### Pruning with compensation
+
+`MICROGPT_PRUNE=1` (or a list such as `MICROGPT_PRUNE=8,16,32`) runs a pruning study after
+training: hidden neurons are removed from every expert of every layer and the held-out loss is
+measured at each level, for three ways of choosing and removing them.
+
+- **magnitude:** drop the neurons with the smallest `||fc1[j]|| * ||fc2[:, j]||`; change nothing else.
+- **activation:** drop the smallest `||fc2[:, j]||^2 * E[r_j^2]` (output weight times how much the
+  neuron fires); change nothing else.
+- **OBS + compensation:** Optimal Brain Surgeon on the layer's own reconstruction problem. With
+  `R` the hidden activations on 4000 training names, choose the pruned `fc2'` minimising
+  `||fc2 R - fc2' R||^2`. That quadratic's Hessian is `G = R R^T`, so removing neuron `j` costs
+  `||fc2[:, j]||^2 / [G^-1]_jj` and the surviving columns absorb it through
+  `fc2[i, :] -= fc2[i, j] / [G^-1]_jj * G^-1[j, :]`; `G^-1` then drops row and column `j` by its
+  Schur complement, and the next cheapest neuron goes. This is the layer-wise form of the
+  second-order pruning theory (Hassibi & Stork 1993) that SparseGPT and Optimal Brain
+  Compression apply to large language models.
+- **OBS + fine-tune:** the OBS-pruned model trained for `MICROGPT_PRUNE_FINETUNE` more steps
+  (default 2000) at a fifth of the learning rate. A pruned neuron has its `fc1` row and `fc2`
+  column zeroed, and `relu(0) = 0` keeps it dead under training.
+
+Held-out loss after removing `k` of 64 hidden neurons (per expert), 4 threads:
+
+| model | base | k | magnitude | activation | OBS | OBS + fine-tune |
+|---|---|---|---|---|---|---|
+| dense, `20000 16 4` (12 neurons never activate) | 2.121 | 16 | 2.131 | 2.122 | **2.121** | 2.124 |
+| | | 32 | 2.211 | 2.147 | 2.135 | **2.132** |
+| | | 48 | 2.270 | 2.194 | 2.180 | **2.153** |
+| dense, `20000 64 4` (no dead neurons) | 2.100 | 16 | 2.237 | 2.145 | 2.127 | **2.112** |
+| | | 32 | 2.401 | 2.236 | 2.169 | **2.129** |
+| | | 48 | 2.510 | 2.341 | 2.254 | **2.156** |
+| 8 experts of 64, `20000 64 4` | 2.058 | 16 | 2.240 | 2.103 | 2.086 | **2.068** |
+| | | 32 | 2.371 | 2.176 | 2.141 | **2.091** |
+| | | 48 | 2.428 | 2.286 | 2.216 | **2.123** |
+
+What the numbers say. Magnitude pruning is the wrong criterion at every level: a neuron with
+small weights can still carry most of the layer's variance. Ranking by activation fixes most of
+that, and compensation on top is worth a further 0.01-0.09. The default-trained model has 12
+neurons that never fire, so the first 16 come off for free with any Hessian-aware method; the
+better-trained 64 x 4 model has no dead neurons and every removal costs. A short fine-tune
+recovers about half of what pruning costs beyond the free region (removing half of the
+64 x 4 model's neurons ends 0.03 above the unpruned model instead of 0.07), but at 16 removed it
+slightly *hurts* the default model, because a fresh Adam at a fifth of the rate perturbs an
+already converged network more than it repairs. The experts prune about as gracefully as the
+dense MLP per neuron, and since they hold 8x the neurons, the mixture loses far less per
+parameter removed.
+
 ### Findings from the sweeps (held-out loss, 4 threads unless noted)
 
 - **Seed noise:** four seeds of `20000 16 4` end at 2.120-2.130, so differences under ~0.01 are noise.

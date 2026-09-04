@@ -96,7 +96,7 @@
   <header>
     <div class="eyebrow">microgpt · Rust port · Apple M1 Pro · September 2026</div>
     <h1>The gist's GPT, 8,000x faster, and what that speed let us learn</h1>
-    <p class="lede">Karpathy's <code>microgpt.py</code> trains a 4,192-parameter character-level GPT on 32,033 names with a scalar autograd engine. This port keeps the maths and drops the engine. The wall-clock savings were then spent on the sweeps below: batch size, threads, learning rate, seeds and model size, each judged on the same 1,000 held-out names, and finally on a mixture-of-experts MLP whose experts turn out to be readable.</p>
+    <p class="lede">Karpathy's <code>microgpt.py</code> trains a 4,192-parameter character-level GPT on 32,033 names with a scalar autograd engine. This port keeps the maths and drops the engine. The wall-clock savings were then spent on the sweeps below: batch size, threads, learning rate, seeds and model size, each judged on the same 1,000 held-out names, then on a mixture-of-experts MLP whose experts turn out to be readable, and on pruning neurons with second-order compensation.</p>
     <div class="tiles">
       <div class="tile"><div class="label">Gist recipe, Python (1000 steps)</div><div class="value">109 s</div><div class="sub">CPython 3, scalar autograd</div></div>
       <div class="tile"><div class="label">Gist recipe, this port</div><div class="value">14 ms</div><div class="sub">same model, same steps, one thread</div></div>
@@ -234,7 +234,29 @@
   </section>
 
   <section>
-    <div class="eyebrow">07 · Recommendations</div>
+    <div class="eyebrow">07 · Pruning</div>
+    <h2>Removing neurons, and letting the others compensate</h2>
+    <p>Can a trained model lose hidden neurons if the remaining ones adjust? The theory is second-order: near a minimum the loss change of a weight perturbation is <code>½ δwᵀ H δw</code>, and removing weight <code>q</code> under that quadratic has a closed form, Optimal Brain Surgeon (Hassibi &amp; Stork, 1993): the cost is <code>w_q² / 2[H⁻¹]_qq</code> and the compensation is a rank-one update of every other weight. The full Hessian is out of reach for anything large, so modern methods (Optimal Brain Compression, SparseGPT) solve it one linear layer at a time on the layer's own reconstruction error <code>‖W X − Ŵ X‖²</code>, whose Hessian is exactly <code>X Xᵀ</code>, a small matrix. That is what <code>MICROGPT_PRUNE=1</code> does for the hidden neurons of every expert: with <code>R</code> the hidden activations on 4000 training names and <code>G = R Rᵀ</code>, neuron <code>j</code> costs <code>‖fc2[:,j]‖² / [G⁻¹]_jj</code>, the surviving output columns absorb it, <code>G⁻¹</code> loses row and column <code>j</code> by its Schur complement, and the next cheapest neuron goes. Two cruder criteria are run alongside for comparison: smallest weight magnitude with no compensation, and smallest <code>‖fc2[:,j]‖² · E[r_j²]</code> with no compensation. A fourth column fine-tunes the OBS-pruned model for 2000 steps at a fifth of the learning rate.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Model</th><th class="num">Base</th><th class="num">Removed of 64</th><th class="num">Magnitude</th><th class="num">Activation</th><th class="num">OBS + compensation</th><th class="num">OBS + fine-tune</th></tr></thead>
+      <tbody>
+        <tr><td rowspan="3">dense, 20000 x 16 (12 neurons never activate)</td><td class="num" rowspan="3">2.121</td><td class="num">16</td><td class="num">2.131</td><td class="num">2.122</td><td class="num"><strong>2.121</strong></td><td class="num">2.124</td></tr>
+        <tr><td class="num">32</td><td class="num">2.211</td><td class="num">2.147</td><td class="num">2.135</td><td class="num"><strong>2.132</strong></td></tr>
+        <tr><td class="num">48</td><td class="num">2.270</td><td class="num">2.194</td><td class="num">2.180</td><td class="num"><strong>2.153</strong></td></tr>
+        <tr><td rowspan="3">dense, 20000 x 64 (no dead neurons)</td><td class="num" rowspan="3">2.100</td><td class="num">16</td><td class="num">2.237</td><td class="num">2.145</td><td class="num">2.127</td><td class="num"><strong>2.112</strong></td></tr>
+        <tr><td class="num">32</td><td class="num">2.401</td><td class="num">2.236</td><td class="num">2.169</td><td class="num"><strong>2.129</strong></td></tr>
+        <tr><td class="num">48</td><td class="num">2.510</td><td class="num">2.341</td><td class="num">2.254</td><td class="num"><strong>2.156</strong></td></tr>
+        <tr><td rowspan="3">8 experts of 64, 20000 x 64 (per expert)</td><td class="num" rowspan="3">2.058</td><td class="num">16</td><td class="num">2.240</td><td class="num">2.103</td><td class="num">2.086</td><td class="num"><strong>2.068</strong></td></tr>
+        <tr><td class="num">32</td><td class="num">2.371</td><td class="num">2.176</td><td class="num">2.141</td><td class="num"><strong>2.091</strong></td></tr>
+        <tr><td class="num">48</td><td class="num">2.428</td><td class="num">2.286</td><td class="num">2.216</td><td class="num"><strong>2.123</strong></td></tr>
+      </tbody>
+    </table></div>
+    <p>Four readings. Magnitude is the wrong criterion at every level: a neuron with small weights can still carry much of the layer's variance, and dropping it costs up to 0.4. Ranking by activation fixes most of that, and compensation is worth a further 0.01 to 0.09 on top. The default-trained model has 12 neurons that never fire on any training name, so its first 16 come off for free with either Hessian-aware method, while the 64 x 4 model has no dead neurons and every removal costs; a well-trained network uses all of itself. A short fine-tune recovers about half of the damage beyond the free region, but slightly <em>hurts</em> at 16 removed in the default model, where a fresh Adam perturbs a converged network more than it repairs. And the experts prune about as gracefully as the dense MLP per neuron while holding eight times as many, so the mixture loses far less per parameter removed.</p>
+    <p class="note">Removal zeroes a neuron's <code>fc1</code> row and <code>fc2</code> column; <code>relu(0) = 0</code> keeps it dead under any later training. The buffers keep their compile-time width, so the study measures loss, not speed; a real deployment would rebuild with <code>MICROGPT_HIDDEN</code> at the pruned width.</p>
+  </section>
+
+  <section>
+    <div class="eyebrow">08 · Recommendations</div>
     <h2>What to run</h2>
     <div class="callout">
       <p><strong>Want to see experts specialise:</strong> <code>MICROGPT_N_EXPERTS=8 MICROGPT_TOP_K=2 MICROGPT_HIDDEN=64 cargo build --release</code>, then run with <code>MICROGPT_EXPERT_STATS=1</code> to print the routing tables in section 06.</p>
@@ -252,13 +274,13 @@
   </section>
 
   <section>
-    <div class="eyebrow">08 · Method</div>
+    <div class="eyebrow">09 · Method</div>
     <h2>How the numbers were taken</h2>
     <ul>
       <li><strong>Held-out loss</strong> is the mean cross-entropy over the last 1,000 names of the seed-42 shuffle, which are never trained on. Every configuration is scored on the same names. Training-batch losses are not compared across batch sizes.</li>
       <li><strong>Timing</strong> is training wall-clock only, and every number on this page was re-measured with the final code (commit history in the repo records the intermediate builds). Loss logging snapshots the parameters (16 KB) during training and evaluates them afterwards; an earlier inline evaluator slowed the 8-thread run by 75% by disturbing the worker scheduling and was replaced.</li>
       <li><strong>Correctness</strong> rests on an f64 finite-difference gradient check over a few hundred parameters (max relative error under 1e-4, run for all four model shapes and for the mixture-of-experts build), an incremental-versus-full forward equivalence test for the KV cache, and a check that 1-thread and 3-thread training produce the same parameters to 1e-9.</li>
-      <li><strong>Knobs:</strong> positional arguments <code>[steps] [batch] [threads]</code>; environment variables <code>MICROGPT_LR</code>, <code>MICROGPT_SCHEDULE</code> (linear, cosine, constant), <code>MICROGPT_SEED</code>, <code>MICROGPT_LOG</code> / <code>MICROGPT_EVAL_EVERY</code>, <code>MICROGPT_EXPERT_STATS</code>; model shape and experts at build time via <code>MICROGPT_N_LAYER</code>, <code>MICROGPT_N_EMBD</code>, <code>MICROGPT_N_HEAD</code>, <code>MICROGPT_BLOCK_SIZE</code>, <code>MICROGPT_N_EXPERTS</code>, <code>MICROGPT_TOP_K</code>, <code>MICROGPT_HIDDEN</code>. The data shuffle and held-out split always use seed 42; <code>MICROGPT_SEED</code> reseeds only the parameter initialisation, so seed 42 given explicitly is a different initialisation from the unset default (the gist's single stream). Tables that set seeds explicitly are like for like within themselves but a few thousandths off the default-seed tables.</li>
+      <li><strong>Knobs:</strong> positional arguments <code>[steps] [batch] [threads]</code>; environment variables <code>MICROGPT_LR</code>, <code>MICROGPT_SCHEDULE</code> (linear, cosine, constant), <code>MICROGPT_SEED</code>, <code>MICROGPT_LOG</code> / <code>MICROGPT_EVAL_EVERY</code>, <code>MICROGPT_EXPERT_STATS</code>, <code>MICROGPT_PRUNE</code> / <code>MICROGPT_PRUNE_FINETUNE</code>; model shape and experts at build time via <code>MICROGPT_N_LAYER</code>, <code>MICROGPT_N_EMBD</code>, <code>MICROGPT_N_HEAD</code>, <code>MICROGPT_BLOCK_SIZE</code>, <code>MICROGPT_N_EXPERTS</code>, <code>MICROGPT_TOP_K</code>, <code>MICROGPT_HIDDEN</code>. The data shuffle and held-out split always use seed 42; <code>MICROGPT_SEED</code> reseeds only the parameter initialisation, so seed 42 given explicitly is a different initialisation from the unset default (the gist's single stream). Tables that set seeds explicitly are like for like within themselves but a few thousandths off the default-seed tables.</li>
       <li><strong>Machine:</strong> Apple M1 Pro, 8 performance + 2 efficiency cores, Rust 1.97 stable. The Python baseline is CPython 3 on the same laptop. The RNG is xoshiro256** and does not reproduce Python's stream, so exact losses differ from the gist.</li>
       <li><strong>Code:</strong> <code>src/main.rs</code> (about 1,600 lines including tests), <code>build.rs</code> for the model shape and expert configuration, <code>docs/loss-curves.html</code> and <code>docs/loss-logs/</code> for the recorded runs. Source and pages: <a href="https://github.com/kodart/microgpt">github.com/kodart/microgpt</a>.</li>
     </ul>
