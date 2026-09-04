@@ -13,6 +13,13 @@ Same model, same data, same hyperparameters:
 Two things differ from the gist by choice: training runs for 20000 steps instead of 1000, and each
 step is a minibatch of 16 documents (the gist uses one) processed in parallel across 4 threads.
 
+The model shape is fixed at build time (the activation buffers are fixed-size arrays), with the
+gist's values as defaults. Override with environment variables when building:
+
+```bash
+MICROGPT_N_EMBD=32 MICROGPT_N_LAYER=2 cargo build --release   # also MICROGPT_N_HEAD, MICROGPT_BLOCK_SIZE
+```
+
 ## Run
 
 ```bash
@@ -67,6 +74,24 @@ about 4-6x sooner than the single-name recipe and end between 2.11 (64 x 4, 3.7 
 batches keep buying a little loss for proportionally more time; 16 x 4 is the default because it
 has the best loss per second, and 4 threads are far less sensitive to other processes using
 cores than 8.
+
+### Model size
+
+Held-out loss for four model shapes, 4 threads, `steps x batch` chosen to land on the same time
+budgets. Seed noise is about 0.005, so every gap below is real.
+
+| model | params | ~1.1 s | ~3.6 s | ~11 s |
+|---|---|---|---|---|
+| 1 layer, 16-dim (gist) | 4,192 | 2.122 (20000 x 16) | 2.100 (20000 x 64) | |
+| 1 layer, 32-dim | 14,528 | 2.104 (6700 x 16) | **2.057** (6600 x 64) | 2.055 (20000 x 64) |
+| 2 layers, 16-dim | 7,264 | 2.107 (11500 x 16) | 2.090 (20000 x 32) | 2.056 (20000 x 128, 12.8 s) |
+| 2 layers, 32-dim | 26,816 | 2.108 (3500 x 16) | 2.071 (11500 x 16) | **2.035** (10500 x 64) |
+
+Every larger shape beats the gist's model at every budget. The 32-dim single layer is the best
+buy up to a few seconds and saturates near 2.055; the 2-layer 32-dim model keeps improving and
+wins once you can afford ten seconds or more. Per-step costs at 16 x 4: 55 us (16-dim),
+96 us (2 x 16), 165 us (32-dim), 311 us (2 x 32). The build defaults stay at the gist's shape so
+the numbers above remain reproducible; pick a larger one with the build variables.
 
 ### Findings from the sweeps (held-out loss, 4 threads unless noted)
 

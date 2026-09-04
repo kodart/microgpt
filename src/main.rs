@@ -37,10 +37,9 @@ type Float = f64;
 // Hyperparameters (same values as the gist)
 // ---------------------------------------------------------------------------------------------
 
-const N_LAYER: usize = 1; // depth of the transformer (number of layers)
-const N_EMBD: usize = 16; // width of the network (embedding dimension)
-const BLOCK_SIZE: usize = 16; // maximum context length (the longest name is 15 characters)
-const N_HEAD: usize = 4; // number of attention heads
+// N_LAYER, N_EMBD, BLOCK_SIZE and N_HEAD come from build.rs: the gist's values (1, 16, 16, 4)
+// unless overridden with MICROGPT_N_LAYER / MICROGPT_N_EMBD / ... at build time.
+include!(concat!(env!("OUT_DIR"), "/model_config.rs"));
 const HEAD_DIM: usize = N_EMBD / N_HEAD; // dimension of each head
 const N_HIDDEN: usize = 4 * N_EMBD; // MLP hidden width
 const INIT_STD: Float = 0.08; // std of the gaussian parameter init
@@ -997,7 +996,7 @@ fn main() -> io::Result<()> {
 
     let model = Model::new(data.vocab_size());
     let mut params = model.init_params(&mut rng);
-    println!("num params: {}", model.n_params);
+    println!("model: {N_LAYER} layer(s), n_embd {N_EMBD}, {N_HEAD} heads, block size {BLOCK_SIZE} | num params: {}", model.n_params);
     println!(
         "steps: {} | batch size: {} | threads: {} | lr: {} | seed: {}",
         cfg.num_steps,
@@ -1111,7 +1110,10 @@ mod tests {
             if numeric.abs() > 1e-7 || analytic.abs() > 1e-7 {
                 max_rel = max_rel.max(rel);
                 checked += 1;
-                assert!(rel < 1e-4, "param {idx}: analytic {analytic} vs numeric {numeric} (rel {rel})");
+                // central differences with h = 1e-5 resolve gradients to roughly 1e-10 absolute;
+                // for the wider/deeper models some gradients are ~1e-6, so allow either bound
+                let abs = (numeric - analytic).abs();
+                assert!(rel < 1e-4 || abs < 1e-8, "param {idx}: analytic {analytic} vs numeric {numeric} (rel {rel}, abs {abs})");
             }
         }
         assert!(checked > 300, "too few non-zero gradients checked: {checked}");

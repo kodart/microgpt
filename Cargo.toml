@@ -2,6 +2,7 @@
 name = "microgpt"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 description = "The most atomic way to train and run inference for a GPT, in dependency-free Rust"
 
 [dependencies]
