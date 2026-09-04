@@ -209,6 +209,35 @@ already converged network more than it repairs. The experts prune about as grace
 dense MLP per neuron, and since they hold 8x the neurons, the mixture loses far less per
 parameter removed.
 
+### BLAS and the GPU
+
+Both were measured rather than assumed. Routing the three matmul kernels through Apple's
+Accelerate `cblas_sgemm` (which uses the AMX matrix coprocessor) makes every model *slower* on
+whole training steps, even though Accelerate wins an isolated per-call benchmark on the 32-dim
+shapes by 3-7x:
+
+| model | config | our kernels | Accelerate |
+|---|---|---|---|
+| gist (16-dim) | 20000 x 16 x 4 | 43 µs/step | 62 µs/step |
+| 2 layers, 32-dim, hidden 128 | 20000 x 16 x 4 | 218 | 243 |
+| 2 layers, 32-dim, hidden 128 | 5000 x 64 x 4 | 729 | 810 |
+| 2 layers, 32-dim, 8 experts of 64 | 20000 x 16 x 4 | 281 | 564 |
+
+Per document the matrices have only 16 rows (one per position), so each call is a few hundred
+nanoseconds of arithmetic and BLAS's per-call overhead dominates; our kernels also get their
+dimensions constant-folded and fully unrolled in the real build, which the isolated benchmark
+hides. The expert groups (about 4 rows each) are hopeless for BLAS. Where Accelerate does win is
+on the *same* shapes with hundreds of rows: at 256 rows it runs the 32-dim layers at ~700 GFLOP/s
+against ~45 for our kernels, which do no cache blocking. So BLAS pays only after a structural
+change, batching positions across all the documents of a worker's share so each layer stage is
+one large matmul; that is the route to a several-fold gain on the 2-layer models, not a drop-in.
+
+The GPU (Metal, via wgpu) is further off: a synchronous kernel round trip measures 1.3 ms on
+this M1 Pro and each queued dispatch about 2.6 µs, so even a fully resident training loop with
+its 10-15 dispatches per step would start near the CPU's 44 µs step before doing any arithmetic.
+It pays only for batches of thousands of names, which train worse per name at this data size,
+or for models far larger than any here.
+
 ### Findings from the sweeps (held-out loss, 4 threads unless noted)
 
 - **Seed noise:** four seeds of `20000 16 4` end at 2.120-2.130, so differences under ~0.01 are noise.
