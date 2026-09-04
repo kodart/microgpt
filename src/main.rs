@@ -168,25 +168,12 @@ fn dot(a: &[Float], b: &[Float]) -> Float {
 /// reduction instead of being re-read and re-written from L1 for every term.
 const ACC: usize = 16;
 
-/// C[n x m] = A[n x k] . B[m x k]^T  -- rows of A against rows of a weight matrix laid out
-/// [out][in], i.e. the forward pass of a linear layer over `n` positions at once.
+/// C[n x k] (+)= A[n x m] . B[m x k]. Each 16-wide chunk of an output row is accumulated in
+/// registers over all `m` terms and written back once, so the inner loop is pure vector FMAs
+/// with no horizontal reductions. Used for the forward pass against transposed weights
+/// (B = W^T laid out [in][out]) and for dX += dY . W in the backward pass (B = W, [out][in]).
 #[inline]
-fn matmul_abt(a: &[Float], n: usize, k: usize, b: &[Float], m: usize, c: &mut [Float]) {
-    debug_assert!(a.len() >= n * k && b.len() == m * k && c.len() >= n * m);
-    for i in 0..n {
-        let ai = &a[i * k..(i + 1) * k];
-        let ci = &mut c[i * m..(i + 1) * m];
-        for o in 0..m {
-            ci[o] = dot(ai, &b[o * k..(o + 1) * k]);
-        }
-    }
-}
-
-/// C[n x k] += A[n x m] . B[m x k]  -- dX += dY . W for a weight matrix W laid out [out][in]
-/// (m = out, k = in). Each 16-wide chunk of an output row is accumulated in registers over all
-/// `m` terms before being written back once.
-#[inline]
-fn matmul_ab_acc(a: &[Float], n: usize, m: usize, b: &[Float], k: usize, c: &mut [Float]) {
+fn matmul_ab_impl<const ACCUM: bool>(a: &[Float], n: usize, m: usize, b: &[Float], k: usize, c: &mut [Float]) {
     debug_assert!(a.len() >= n * m && b.len() == m * k && c.len() >= n * k);
     for i in 0..n {
         let ai = &a[i * m..(i + 1) * m];
@@ -194,7 +181,9 @@ fn matmul_ab_acc(a: &[Float], n: usize, m: usize, b: &[Float], k: usize, c: &mut
         let mut cs = 0;
         while cs + ACC <= k {
             let mut acc = [0.0 as Float; ACC];
-            acc.copy_from_slice(&ci[cs..cs + ACC]);
+            if ACCUM {
+                acc.copy_from_slice(&ci[cs..cs + ACC]);
+            }
             for o in 0..m {
                 let g = ai[o];
                 let bo = &b[o * k + cs..o * k + cs + ACC];
@@ -206,13 +195,25 @@ fn matmul_ab_acc(a: &[Float], n: usize, m: usize, b: &[Float], k: usize, c: &mut
             cs += ACC;
         }
         for j in cs..k {
-            let mut v = ci[j];
+            let mut v = if ACCUM { ci[j] } else { 0.0 };
             for o in 0..m {
                 v = ai[o].mul_add(b[o * k + j], v);
             }
             ci[j] = v;
         }
     }
+}
+
+/// C[n x k] = A[n x m] . B[m x k]
+#[inline]
+fn matmul_ab(a: &[Float], n: usize, m: usize, b: &[Float], k: usize, c: &mut [Float]) {
+    matmul_ab_impl::<false>(a, n, m, b, k, c)
+}
+
+/// C[n x k] += A[n x m] . B[m x k]
+#[inline]
+fn matmul_ab_acc(a: &[Float], n: usize, m: usize, b: &[Float], k: usize, c: &mut [Float]) {
+    matmul_ab_impl::<true>(a, n, m, b, k, c)
 }
 
 /// C[m x k] += A[n x m]^T . B[n x k]  -- dW += dY^T . X summed over the `n` positions of a
@@ -363,6 +364,28 @@ impl Model {
     fn init_params(&self, rng: &mut Rng) -> Vec<Float> {
         (0..self.n_params).map(|_| rng.gauss(0.0, INIT_STD)).collect()
     }
+
+    /// The weight matrices used by linear layers, i.e. everything except the embedding tables.
+    fn linear_tensors(&self) -> impl Iterator<Item = Tensor> + '_ {
+        std::iter::once(self.lm_head).chain(self.layers.iter().flat_map(|l| [l.wqkv, l.wo, l.fc1, l.fc2]))
+    }
+
+    /// Write the transposed layout of `p` into `pt`: every linear weight [out][in] becomes
+    /// [in][out] at the same offset, the embedding tables are copied as they are. The forward
+    /// pass reads `pt` so that y = x W^T is a register-accumulated row update instead of one
+    /// horizontally-reduced dot product per output. About 1 us for the default model; done
+    /// once per optimizer step.
+    fn transpose_into(&self, p: &[Float], pt: &mut [Float]) {
+        pt[..self.lm_head.off].copy_from_slice(&p[..self.lm_head.off]); // wte, wpe
+        for t in self.linear_tensors() {
+            let (src, dst) = (t.view(p), t.view_mut(pt));
+            for o in 0..t.rows {
+                for j in 0..t.cols {
+                    dst[j * t.rows + o] = src[o * t.cols + j];
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -461,7 +484,9 @@ impl Model {
     ///
     /// Each layer is applied stage by stage over all `from..to` positions: the linear layers are
     /// one small matmul over the positions, and only attention and rmsnorm loop per position.
-    fn forward(&self, p: &[Float], tokens: &[usize], from: usize, to: usize, a: &mut Acts) {
+    /// `pt` is the transposed parameter layout from [`Model::transpose_into`]; `p` is only needed
+    /// for the embedding tables.
+    fn forward(&self, p: &[Float], pt: &[Float], tokens: &[usize], from: usize, to: usize, a: &mut Acts) {
         const E: usize = N_EMBD;
         let n = to - from;
         let rows = from * E..to * E;
@@ -488,7 +513,7 @@ impl Model {
             for i in from..to {
                 rmsnorm(row(xs_in, i, E), row_mut(&mut la.h, i, E));
             }
-            matmul_abt(&la.h[rows.clone()], n, E, sh.wqkv.view(p), 3 * E, &mut la.qkv[from * 3 * E..to * 3 * E]);
+            matmul_ab(&la.h[rows.clone()], n, E, sh.wqkv.view(pt), 3 * E, &mut la.qkv[from * 3 * E..to * 3 * E]);
             for i in from..to {
                 for hd in 0..N_HEAD {
                     let hs = hd * HEAD_DIM;
@@ -510,7 +535,7 @@ impl Model {
                     }
                 }
             }
-            matmul_abt(&la.attn_out[rows.clone()], n, E, sh.wo.view(p), E, &mut la.x2[rows.clone()]);
+            matmul_ab(&la.attn_out[rows.clone()], n, E, sh.wo.view(pt), E, &mut la.x2[rows.clone()]);
             add_assign(&mut la.x2[rows.clone()], &xs_in[rows.clone()]);
 
             // 2) MLP block
@@ -518,16 +543,16 @@ impl Model {
                 rmsnorm(row(&la.x2, i, E), row_mut(&mut la.h2, i, E));
             }
             let hrows = from * N_HIDDEN..to * N_HIDDEN;
-            matmul_abt(&la.h2[rows.clone()], n, E, sh.fc1.view(p), N_HIDDEN, &mut la.r[hrows.clone()]);
+            matmul_ab(&la.h2[rows.clone()], n, E, sh.fc1.view(pt), N_HIDDEN, &mut la.r[hrows.clone()]);
             for v in la.r[hrows.clone()].iter_mut() {
                 *v = v.max(0.0);
             }
-            matmul_abt(&la.r[hrows], n, N_HIDDEN, sh.fc2.view(p), E, &mut xs_out[rows.clone()]);
+            matmul_ab(&la.r[hrows], n, N_HIDDEN, sh.fc2.view(pt), E, &mut xs_out[rows.clone()]);
             add_assign(&mut xs_out[rows.clone()], &la.x2[rows.clone()]);
         }
 
         let v = self.vocab_size;
-        matmul_abt(&a.xs[N_LAYER][rows], n, E, self.lm_head.view(p), v, &mut a.logits[from * v..to * v]);
+        matmul_ab(&a.xs[N_LAYER][rows], n, E, self.lm_head.view(pt), v, &mut a.logits[from * v..to * v]);
     }
 
     /// Softmax the first `n` logit rows into `probs` and return the mean cross-entropy loss
@@ -673,11 +698,13 @@ impl Model {
         if docs.is_empty() {
             return Float::NAN;
         }
+        let mut pt = vec![0.0 as Float; p.len()];
+        self.transpose_into(p, &mut pt);
         let mut total = 0.0;
         for doc in docs {
             data.tokenize(doc, tokens);
             let n = (tokens.len() - 1).min(BLOCK_SIZE);
-            self.forward(p, tokens, 0, n, acts);
+            self.forward(p, &pt, tokens, 0, n, acts);
             total += self.loss(tokens, n, acts);
         }
         total / docs.len() as Float
@@ -816,6 +843,7 @@ struct Shared {
     done: AtomicUsize,     // workers that have finished the current epoch
     batch_size: usize,
     params: RwLock<Vec<Float>>,
+    params_t: RwLock<Vec<Float>>, // transposed layout for the forward pass, refreshed after Adam
     slots: Vec<WorkerSlot>,
 }
 
@@ -879,6 +907,7 @@ impl<'a> Worker<'a> {
         let shared = self.shared;
         let base = (epoch - 1) * shared.batch_size;
         let p = shared.params.read().unwrap();
+        let pt = shared.params_t.read().unwrap();
         let mut grad = self.slot.grad.lock().unwrap();
         let mut loss_sum = 0.0;
         loop {
@@ -889,7 +918,7 @@ impl<'a> Worker<'a> {
             let doc = &self.data.docs[(base + k) % self.data.n_train];
             self.data.tokenize(doc, &mut self.tokens);
             let n = (self.tokens.len() - 1).min(BLOCK_SIZE);
-            self.model.forward(&p, &self.tokens, 0, n, &mut self.acts);
+            self.model.forward(&p, &pt, &self.tokens, 0, n, &mut self.acts);
             loss_sum += self.model.loss(&self.tokens, n, &mut self.acts);
             self.model.backward(&p, &mut grad, &self.tokens, n, &self.acts, &mut self.scratch);
         }
@@ -910,8 +939,10 @@ fn train(model: &Model, data: &Dataset, params: &mut Vec<Float>, cfg: &TrainConf
         done: AtomicUsize::new(0),
         batch_size,
         params: RwLock::new(std::mem::take(params)),
+        params_t: RwLock::new(vec![0.0 as Float; n_params]),
         slots: (0..n_threads).map(|_| WorkerSlot { grad: Mutex::new(vec![0.0 as Float; n_params]), loss: Mutex::new(0.0) }).collect(),
     };
+    model.transpose_into(&shared.params.read().unwrap(), &mut shared.params_t.write().unwrap());
     let mut grads = vec![0.0 as Float; n_params];
     let mut adam = Adam::new(n_params);
     let mut loss = 0.0;
@@ -969,7 +1000,11 @@ fn train(model: &Model, data: &Dataset, params: &mut Vec<Float>, cfg: &TrainConf
             loss = loss_sum * inv_b;
 
             let lr_t = cfg.lr * (1.0 - step as Float / num_steps as Float); // linear decay
-            adam.step(&mut shared.params.write().unwrap(), &mut grads, lr_t, step + 1);
+            {
+                let mut p = shared.params.write().unwrap();
+                adam.step(&mut p, &mut grads, lr_t, step + 1);
+                model.transpose_into(&p, &mut shared.params_t.write().unwrap());
+            }
 
             if logging {
                 interval_loss += loss;
@@ -1080,12 +1115,14 @@ fn main() -> io::Result<()> {
     // Inference: may the model babble back to us
     writeln!(out, "--- inference (new, hallucinated names) ---")?;
     let mut probs = vec![0.0 as Float; v];
+    let mut params_t = vec![0.0 as Float; params.len()];
+    model.transpose_into(&params, &mut params_t);
     for sample_idx in 0..NUM_SAMPLES {
         tokens.clear();
         tokens.push(data.bos);
         let mut sample = String::new();
         for pos in 0..BLOCK_SIZE {
-            model.forward(&params, &tokens, pos, pos + 1, &mut acts); // earlier positions = KV cache
+            model.forward(&params, &params_t, &tokens, pos, pos + 1, &mut acts); // earlier positions = KV cache
             let logits = row(&acts.logits, pos, v);
             for (pr, &lg) in probs.iter_mut().zip(logits) {
                 *pr = lg / TEMPERATURE;
@@ -1120,7 +1157,9 @@ mod tests {
     }
 
     fn full_loss(model: &Model, p: &[Float], tokens: &[usize], n: usize, acts: &mut Acts) -> Float {
-        model.forward(p, tokens, 0, n, acts);
+        let mut pt = vec![0.0; p.len()];
+        model.transpose_into(p, &mut pt);
+        model.forward(p, &pt, tokens, 0, n, acts);
         model.loss(tokens, n, acts)
     }
 
@@ -1182,11 +1221,13 @@ mod tests {
         data.tokenize("isabella", &mut tokens);
         let n = tokens.len() - 1;
 
+        let mut pt = vec![0.0; params.len()];
+        model.transpose_into(&params, &mut pt);
         let mut full = Acts::new(model.vocab_size);
-        model.forward(&params, &tokens, 0, n, &mut full);
+        model.forward(&params, &pt, &tokens, 0, n, &mut full);
         let mut inc = Acts::new(model.vocab_size);
         for pos in 0..n {
-            model.forward(&params, &tokens, pos, pos + 1, &mut inc);
+            model.forward(&params, &pt, &tokens, pos, pos + 1, &mut inc);
         }
         for (a, b) in full.logits[..n * model.vocab_size].iter().zip(&inc.logits) {
             assert!((a - b).abs() < 1e-12, "{a} vs {b}");

@@ -95,12 +95,12 @@
 <main>
   <header>
     <div class="eyebrow">microgpt · Rust port · Apple M1 Pro · September 2026</div>
-    <h1>The gist's GPT, 8,000x faster, and what that speed let us learn</h1>
+    <h1>The gist's GPT, 9,000x faster, and what that speed let us learn</h1>
     <p class="lede">Karpathy's <code>microgpt.py</code> trains a 4,192-parameter character-level GPT on 32,033 names with a scalar autograd engine. This port keeps the maths and drops the engine. The wall-clock savings were then spent on the sweeps below: batch size, threads, learning rate, seeds and model size, each judged on the same 1,000 held-out names.</p>
     <div class="tiles">
       <div class="tile"><div class="label">Gist recipe, Python (1000 steps)</div><div class="value">109 s</div><div class="sub">CPython 3, scalar autograd</div></div>
-      <div class="tile"><div class="label">Gist recipe, this port</div><div class="value">13 ms</div><div class="sub">same model, same steps, one thread</div></div>
-      <div class="tile"><div class="label">Default run, held-out loss</div><div class="value">2.122</div><div class="sub">20000 steps x 16 names, 4 threads, 1.1 s</div></div>
+      <div class="tile"><div class="label">Gist recipe, this port</div><div class="value">12 ms</div><div class="sub">same model, same steps, one thread</div></div>
+      <div class="tile"><div class="label">Default run, held-out loss</div><div class="value">2.120</div><div class="sub">20000 steps x 16 names, 4 threads, 0.9 s</div></div>
       <div class="tile"><div class="label">Best run, held-out loss</div><div class="value">2.031</div><div class="sub">2 layers, 32-dim, 10500 x 64, 11 s</div></div>
     </div>
   </header>
@@ -115,11 +115,13 @@
         <tr><td><strong>Hand-derived vector backward</strong></td><td>Explicit backward kernels for embedding, rmsnorm, fused QKV, causal softmax attention, output projection, ReLU MLP, LM head and cross-entropy. Parameters, gradients and Adam moments are four flat vectors.</td><td class="num">109 s → 20 ms</td></tr>
         <tr><td><strong>Fixed-size activation arrays</strong></td><td>Activations and backward scratch are inline arrays in one boxed struct instead of separate heap <code>Vec</code>s. With <code>Vec</code>s reached through a reference, LLVM cannot prove the buffers are disjoint and emits ~25% fewer vector ops plus spills. This cost a day's worth of bisecting to find.</td><td class="num">15.9 → 12.5 µs per name</td></tr>
         <tr><td><strong>Vector FMA kernels</strong></td><td>Every accumulate uses <code>mul_add</code>; the dot product keeps four independent lanes. Rust neither contracts <code>a*b+c</code> nor reassociates float sums, so the hot loop had 602 multiplies and 600 adds and now has 568 fused multiply-adds. A serial FMA chain was <em>slower</em> (latency-bound); the lanes are what matters.</td><td class="num">12.2 → 10.6 µs per name</td></tr>
-        <tr><td><strong>Minibatches over a worker pool</strong></td><td>Workers claim names from an atomic counter and accumulate into private gradient buffers; the main thread reduces, runs Adam and publishes the next step on an atomic epoch. Spin-then-yield waits, because a step is tens of microseconds and channel wake-ups cost more than the compute.</td><td class="num">3.2x at 4 threads, 5x at 8</td></tr>
+        <tr><td><strong>Position-batched linear layers</strong></td><td>Forward and backward apply each linear layer to all positions of a name at once. The weight gradient becomes <code>dW += dY^T X</code> summed over positions with 16-float chunks of each output row held in registers, so <code>dW</code> is touched once per name instead of once per position.</td><td class="num">10.6 → 9.1 µs per name</td></tr>
+        <tr><td><strong>Forward against transposed weights</strong></td><td>A profile (never-inlined kernels under <code>sample</code>) showed the forward's one-dot-per-output form taking 45% of the time for a third of the FLOPs: a 16-element dot is mostly horizontal-reduction overhead. The forward now reads a transposed copy of the weights, refreshed after each Adam step in about a microsecond, and computes each output row as register-accumulated <code>y += x[j]·Wt[j]</code> updates, the same shape as the backward matmuls. Two earlier guesses, a fast <code>exp</code> and a 4-row tiled dot, measured no gain and a loss respectively; the profile was what found this.</td><td class="num">9.1 → 7.3 µs per name</td></tr>
+        <tr><td><strong>Minibatches over a worker pool</strong></td><td>Workers claim names from an atomic counter and accumulate into private gradient buffers; the main thread reduces, runs Adam and publishes the next step on an atomic epoch. Spin-then-yield waits, because a step is tens of microseconds and channel wake-ups cost more than the compute.</td><td class="num">2.6x at 4 threads, 5x at 8</td></tr>
         <tr><td><strong>Build flags</strong></td><td>Fat LTO, one codegen unit, <code>panic=abort</code>, <code>target-cpu=native</code>.</td><td class="num">baseline</td></tr>
       </tbody>
     </table></div>
-    <p class="note">Per-name costs are single-thread, 32 names per step. The KV cache for sampling comes for free: the stored K/V rows of the activation buffer are the cache, and generation runs one new position against them.</p>
+    <p class="note">Per-name costs are single-thread, 32 names per step; the port now trains the gist's model at about 7.3 µs per name, against roughly 100 ms per name in Python. The KV cache for sampling comes for free: the stored K/V rows of the activation buffer are the cache, and generation runs one new position against them. The 4-thread speed-up fell from 3.2x to 2.6x as the kernels got faster, because the per-step synchronisation cost did not shrink with them.</p>
   </section>
 
   <section>
@@ -129,10 +131,10 @@
       <h3>Time per optimizer step, 32 names per step</h3>
       <div class="legend" id="lg-threads"></div>
       <div class="plot-wrap"><svg class="plot" id="ch-threads" viewBox="0 0 1000 380" role="img"><title>Step time against thread count</title></svg><div class="tooltip" hidden></div></div>
-      <p class="note">Quiet-machine measurements, 20000 steps. Ten-thread runs are omitted: on this 8-performance + 2-efficiency-core CPU they were 1.6 to 3x slower than eight and never repeatable.</p>
+      <p class="note">Quiet-machine measurements, 20000 steps, taken before the two matmul changes above (the kernels are now 1.45x faster at one thread, so absolute values are lower; the shape of the curve, and the fixed synchronisation cost that bends it, are unchanged). Ten-thread runs are omitted: on this 8-performance + 2-efficiency-core CPU they were 1.6 to 3x slower than eight and never repeatable.</p>
       <details><summary>Table view</summary><div class="table-wrap"><table id="tb-threads"></table></div></details>
     </div>
-    <p style="margin-top:14px">A 32-name step is under 40 µs of arithmetic on eight cores; the barrier plus reduce-and-Adam is another 25 to 30 µs and does not shrink with threads. That fixed cost is why the curve bends. It is also why eight threads are a bad default: with all performance cores busy, any other process (a browser, or macOS's Gatekeeper scanning freshly built binaries, which happened repeatedly during this work) turned 1.5 s runs into 3 to 8 s, while 4-thread runs stayed at 1.1 s throughout. Six threads are about 20% faster than four on a quiet machine and are worth passing explicitly.</p>
+    <p style="margin-top:14px">A 32-name step is now about 30 µs of arithmetic on eight cores; the barrier plus reduce-and-Adam is another 25 to 30 µs and does not shrink with threads. That fixed cost is why the curve bends. It is also why eight threads are a bad default: with all performance cores busy, any other process (a browser, or macOS's Gatekeeper scanning freshly built binaries, which happened repeatedly during this work) turned 1.5 s runs into 3 to 8 s, while 4-thread runs stayed at 1.1 s throughout. Six threads are about 20% faster than four on a quiet machine and are worth passing explicitly.</p>
   </section>
 
   <section>
@@ -164,15 +166,15 @@
     <div class="table-wrap"><table>
       <thead><tr><th>Run</th><th class="num">Training time</th><th class="num">Held-out loss</th><th class="num">Time to reach 2.30</th></tr></thead>
       <tbody>
-        <tr><td>Gist recipe, 20000 x 1, 1 thread</td><td class="num">0.26 s</td><td class="num">2.231</td><td class="num">0.136 s</td></tr>
-        <tr><td>Same recipe, 291000 steps (equal time)</td><td class="num">3.61 s</td><td class="num">2.232</td><td class="num"></td></tr>
-        <tr><td>32 names x 8 threads</td><td class="num">1.33 s</td><td class="num">2.118</td><td class="num">0.024 s</td></tr>
-        <tr><td>16 names x 4 threads (default)</td><td class="num">1.18 s</td><td class="num">2.122</td><td class="num">0.030 s</td></tr>
-        <tr><td>32 names x 4 threads</td><td class="num">2.00 s</td><td class="num">2.112</td><td class="num">0.033 s</td></tr>
-        <tr><td>64 names x 4 threads</td><td class="num">3.73 s</td><td class="num">2.105</td><td class="num">0.038 s</td></tr>
+        <tr><td>Gist recipe, 20000 x 1, 1 thread</td><td class="num">0.22 s</td><td class="num">2.222</td><td class="num">0.109 s</td></tr>
+        <tr><td>Same recipe, 276000 steps (equal time)</td><td class="num">3.14 s</td><td class="num">2.222</td><td class="num"></td></tr>
+        <tr><td>32 names x 8 threads</td><td class="num">1.30 s</td><td class="num">2.112</td><td class="num">0.023 s</td></tr>
+        <tr><td>16 names x 4 threads (default)</td><td class="num">0.95 s</td><td class="num">2.120</td><td class="num">0.025 s</td></tr>
+        <tr><td>32 names x 4 threads</td><td class="num">1.79 s</td><td class="num">2.116</td><td class="num">0.037 s</td></tr>
+        <tr><td>64 names x 4 threads</td><td class="num">3.11 s</td><td class="num">2.103</td><td class="num">0.030 s</td></tr>
       </tbody>
     </table></div>
-    <p class="note">The single-name recipe given nine passes over the data ends no better than after one: with this learning rate schedule it stops improving after a few epochs, while the batched runs keep improving.</p>
+    <p class="note">Re-recorded with the final kernels. The single-name recipe given nine passes over the data ends no better than after one: with this learning rate schedule it stops improving after a few epochs, while the batched runs keep improving.</p>
   </section>
 
   <section>
@@ -182,7 +184,7 @@
       <h3>Held-out loss by time budget, four model shapes</h3>
       <div class="legend" id="lg-model"></div>
       <div class="plot-wrap"><svg class="plot" id="ch-model" viewBox="0 0 1000 380" role="img"><title>Held-out loss against time budget for four model shapes</title></svg><div class="tooltip" hidden></div></div>
-      <p class="note">4 threads. Steps and batch were chosen per model to land on each budget; the exact recipes are in the table. Log-scaled x axis.</p>
+      <p class="note">4 threads, measured before the two matmul changes (every shape is now roughly 1.3x faster at 4 threads, so each budget buys proportionally more steps). Steps and batch were chosen per model to land on each budget; the exact recipes are in the table. Log-scaled x axis.</p>
       <details><summary>Table view</summary><div class="table-wrap"><table id="tb-model"></table></div></details>
     </div>
     <p style="margin-top:14px">Every larger shape beats the gist's model at every budget, including the one-second budget where the bigger models get a fraction of the steps. The 32-dimensional single layer is the best buy up to a few seconds and then saturates near 2.055; the 2-layer 32-dimensional model keeps improving and wins once ten seconds are affordable. Model shape is a build-time choice because the activation buffers are fixed-size arrays:</p>
@@ -206,7 +208,7 @@
       <li><strong>More than 8 threads, or batches above 128.</strong> Both measured worse.</li>
     </ul>
     <h3>Next real speed-up</h3>
-    <p>Training still processes the sixteen positions of a name one at a time, so each weight gradient is a rank-1 update streamed through the gradient buffer sixteen times per name. Running the linear layers over all positions at once, as small matrix multiplies with the weight gradient accumulated once per name, would cut that traffic sixteen-fold and let the compiler register-tile. Expect 1.5 to 2.5x on the kernels.</p>
+    <p>The position-batched matmuls predicted here were implemented afterwards and delivered 1.45x on the kernels (see the table in section 01), less than the 1.5 to 2.5x guessed, and the guess about <em>why</em> was wrong: the gain came from the forward pass, not from gradient-buffer traffic. What is left at 4 threads is mostly the fixed synchronisation cost per step, now a third of a 16-name step; the remaining kernel time is split between the three matmul stages and the per-position attention loop. Fusing the reduce-and-Adam into the workers, or letting workers run several steps of a larger batch before synchronising, would attack the former; the attention loop could be vectorised over heads.</p>
   </section>
 
   <section>

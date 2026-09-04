@@ -72,11 +72,11 @@ does not disturb the timings. The final held-out loss is always printed.
 
 [docs/loss-curves.html](docs/loss-curves.html) charts held-out loss against training wall-clock
 time for the gist's recipe (`20000 1 1`), the same recipe run for the batched runs' time budget
-(`291000 1 1`), and minibatches of 32 on 8 threads and of 16, 32 and 64 on 4 threads
+(`276000 1 1`), and minibatches of 32 on 8 threads and of 16, 32 and 64 on 4 threads
 (`20000 32 8`, `20000 16 4`, `20000 32 4`, `20000 64 4`); the logs are in
 [docs/loss-logs](docs/loss-logs). On this laptop the batched runs reach a held-out loss of 2.30
-about 4-6x sooner than the single-name recipe and end between 2.11 (64 x 4, 3.7 s) and
-2.12 (16 x 4, 1.2 s), versus 2.23 for the single-name recipe given 3.6 s. Bigger
+about 3-5x sooner than the single-name recipe and end between 2.10 (64 x 4, 3.1 s) and
+2.12 (16 x 4, 0.95 s), versus 2.22 for the single-name recipe given 3.1 s. Bigger
 batches keep buying a little loss for proportionally more time; 16 x 4 is the default because it
 has the best loss per second, and 4 threads are far less sensitive to other processes using
 cores than 8.
@@ -126,7 +126,8 @@ identical but removes the graph entirely:
 | **Flat buffers** | Parameters, gradients and both Adam moments are four contiguous `Vec<f32>`; every matrix is a `(offset, rows, cols)` view. Adam is a single vectorisable loop. |
 | **Fixed-size activations** | Activations and backward scratch are inline arrays inside one boxed struct, sized at compile time. This is not cosmetic: with separate heap `Vec`s reached through a reference, LLVM cannot prove the buffers are disjoint and emits ~30% slower forward/backward code (less vectorised, more spills). |
 | **KV cache for free** | The stored K/V rows of the activation buffer *are* the cache: generation runs `forward(pos, pos+1)` against it instead of recomputing the prefix. |
-| **Position-batched linear layers** | Forward and backward apply each linear layer to all positions of a document at once: the forward is one small matmul, and the weight gradient is `dW += dY^T X` summed over positions with 16-float chunks of each output row held in registers, so `dW` is touched once per document instead of once per position. Only attention and rmsnorm still loop per position. Measured 15% faster per document. |
+| **Position-batched linear layers** | Forward and backward apply each linear layer to all positions of a document at once. The weight gradient is `dW += dY^T X` summed over positions, so `dW` is touched once per document instead of once per position. Only attention and rmsnorm still loop per position. 15% faster per document. |
+| **Row-accumulated forward against transposed weights** | Profiling showed the forward's one-dot-product-per-output form taking 45% of the time despite being a third of the FLOPs: a 16-element dot is mostly horizontal-reduction overhead. The forward now reads a transposed copy of the weights (refreshed after each Adam step, ~1 µs) and computes each output row as register-accumulated `y += x[j] * Wt[j]` updates, the same shape as the backward matmuls. Another 1.25x per document. |
 | **Vector FMA kernels** | Every accumulate uses `mul_add`, and the dot product keeps four independent lanes, so the reductions compile to one vector fused multiply-add per four elements instead of separate multiplies and adds in a serial chain (LLVM neither contracts `a*b+c` nor reassociates float sums on its own). Measured 13% faster per document. |
 | **Fused QKV projection** | `attn_wq`, `attn_wk`, `attn_wv` are one `48 x 16` matrix, so one matvec and one outer-product accumulate instead of three. |
 | **Spin-synchronised worker pool** | See above. Main thread works too, so `threads` is the number of computing threads. |
@@ -139,8 +140,8 @@ Measured on an Apple M-series laptop with 8 performance + 2 efficiency cores:
 | `python3 microgpt.py` (1000 steps x 1 doc) | ~109 s |
 | `microgpt 1000 1 1` (same recipe) | ~15 ms |
 | `microgpt 20000 1 1` | ~290 ms (14.5 µs/step) |
-| `microgpt 20000 32 1` | ~5.9 s (290 µs/step, ~9 µs/doc) |
-| `microgpt 20000 16 4` (default) | ~1.0 s (50 µs/step, 3x over one thread) |
+| `microgpt 20000 32 1` | ~4.7 s (235 µs/step, ~7.3 µs/doc) |
+| `microgpt 20000 16 4` (default) | ~0.92 s (46 µs/step, 2.6x over one thread) |
 | `microgpt 20000 32 8` | ~1.6 s (80 µs/step, 5x over one thread) |
 | `microgpt 5000 128 8` | ~1.3 s (250 µs/step, 8x over one thread) |
 
