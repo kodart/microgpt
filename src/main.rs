@@ -1591,7 +1591,7 @@ fn prune(model: &Model, p: &mut [Float], hess: &[Vec<Vec<f64>>], k: usize, metho
                 ginv[j * H + j] += damp;
             }
             invert_f64(&mut ginv, H);
-            let mut removed = vec![false; H];
+            let mut removed = [false; H];
             for _ in 0..k.min(H) {
                 let score = |j: usize| -> f64 {
                     let col2: f64 = (0..E).map(|i| w[i * H + j] * w[i * H + j]).sum();
