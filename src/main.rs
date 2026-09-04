@@ -163,38 +163,94 @@ fn dot(a: &[Float], b: &[Float]) -> Float {
     s
 }
 
-/// y = W x
-#[inline]
-fn matvec(w: &[Float], rows: usize, cols: usize, x: &[Float], y: &mut [Float]) {
-    debug_assert_eq!(w.len(), rows * cols);
-    for r in 0..rows {
-        y[r] = dot(&w[r * cols..(r + 1) * cols], x);
-    }
-}
+/// Width of the register-resident accumulator used by the accumulating matmuls: 16 floats is
+/// four NEON registers, so a chunk of an output row stays in registers across the whole
+/// reduction instead of being re-read and re-written from L1 for every term.
+const ACC: usize = 16;
 
-/// dx += W^T dy
+/// C[n x m] = A[n x k] . B[m x k]^T  -- rows of A against rows of a weight matrix laid out
+/// [out][in], i.e. the forward pass of a linear layer over `n` positions at once.
 #[inline]
-fn matvec_t_acc(w: &[Float], rows: usize, cols: usize, dy: &[Float], dx: &mut [Float]) {
-    debug_assert_eq!(w.len(), rows * cols);
-    for r in 0..rows {
-        let g = dy[r];
-        let wr = &w[r * cols..(r + 1) * cols];
-        for c in 0..cols {
-            dx[c] = g.mul_add(wr[c], dx[c]);
+fn matmul_abt(a: &[Float], n: usize, k: usize, b: &[Float], m: usize, c: &mut [Float]) {
+    debug_assert!(a.len() >= n * k && b.len() == m * k && c.len() >= n * m);
+    for i in 0..n {
+        let ai = &a[i * k..(i + 1) * k];
+        let ci = &mut c[i * m..(i + 1) * m];
+        for o in 0..m {
+            ci[o] = dot(ai, &b[o * k..(o + 1) * k]);
         }
     }
 }
 
-/// dW += dy x^T  (outer product accumulate)
+/// C[n x k] += A[n x m] . B[m x k]  -- dX += dY . W for a weight matrix W laid out [out][in]
+/// (m = out, k = in). Each 16-wide chunk of an output row is accumulated in registers over all
+/// `m` terms before being written back once.
 #[inline]
-fn outer_acc(dw: &mut [Float], rows: usize, cols: usize, dy: &[Float], x: &[Float]) {
-    debug_assert_eq!(dw.len(), rows * cols);
-    for r in 0..rows {
-        let g = dy[r];
-        let dwr = &mut dw[r * cols..(r + 1) * cols];
-        for c in 0..cols {
-            dwr[c] = g.mul_add(x[c], dwr[c]);
+fn matmul_ab_acc(a: &[Float], n: usize, m: usize, b: &[Float], k: usize, c: &mut [Float]) {
+    debug_assert!(a.len() >= n * m && b.len() == m * k && c.len() >= n * k);
+    for i in 0..n {
+        let ai = &a[i * m..(i + 1) * m];
+        let ci = &mut c[i * k..(i + 1) * k];
+        let mut cs = 0;
+        while cs + ACC <= k {
+            let mut acc = [0.0 as Float; ACC];
+            acc.copy_from_slice(&ci[cs..cs + ACC]);
+            for o in 0..m {
+                let g = ai[o];
+                let bo = &b[o * k + cs..o * k + cs + ACC];
+                for j in 0..ACC {
+                    acc[j] = g.mul_add(bo[j], acc[j]);
+                }
+            }
+            ci[cs..cs + ACC].copy_from_slice(&acc);
+            cs += ACC;
         }
+        for j in cs..k {
+            let mut v = ci[j];
+            for o in 0..m {
+                v = ai[o].mul_add(b[o * k + j], v);
+            }
+            ci[j] = v;
+        }
+    }
+}
+
+/// C[m x k] += A[n x m]^T . B[n x k]  -- dW += dY^T . X summed over the `n` positions of a
+/// document, so the weight gradient is touched once per document instead of once per position.
+#[inline]
+fn matmul_atb_acc(a: &[Float], n: usize, m: usize, b: &[Float], k: usize, c: &mut [Float]) {
+    debug_assert!(a.len() >= n * m && b.len() >= n * k && c.len() == m * k);
+    for o in 0..m {
+        let co = &mut c[o * k..(o + 1) * k];
+        let mut cs = 0;
+        while cs + ACC <= k {
+            let mut acc = [0.0 as Float; ACC];
+            acc.copy_from_slice(&co[cs..cs + ACC]);
+            for i in 0..n {
+                let g = a[i * m + o];
+                let bi = &b[i * k + cs..i * k + cs + ACC];
+                for j in 0..ACC {
+                    acc[j] = g.mul_add(bi[j], acc[j]);
+                }
+            }
+            co[cs..cs + ACC].copy_from_slice(&acc);
+            cs += ACC;
+        }
+        for j in cs..k {
+            let mut v = co[j];
+            for i in 0..n {
+                v = a[i * m + o].mul_add(b[i * k + j], v);
+            }
+            co[j] = v;
+        }
+    }
+}
+
+/// x[i] += y[i]
+#[inline]
+fn add_assign(x: &mut [Float], y: &[Float]) {
+    for (a, b) in x.iter_mut().zip(y) {
+        *a += *b;
     }
 }
 
@@ -372,10 +428,10 @@ struct Grads {
     dx: [Float; T * N_EMBD],
     dx2: [Float; T * N_EMBD],
     datt: [Float; T * N_EMBD],
-    dh: [Float; N_EMBD],
-    dr: [Float; N_HIDDEN],
+    dh: [Float; T * N_EMBD],
+    dr: [Float; T * N_HIDDEN],
     dqkv: [Float; T * 3 * N_EMBD],
-    dlogits: Vec<Float>, // [V]
+    dlogits: Vec<Float>, // [T][V]
     dx0: [Float; N_EMBD],
 }
 
@@ -385,10 +441,10 @@ impl Grads {
             dx: [0.0; T * N_EMBD],
             dx2: [0.0; T * N_EMBD],
             datt: [0.0; T * N_EMBD],
-            dh: [0.0; N_EMBD],
-            dr: [0.0; N_HIDDEN],
+            dh: [0.0; T * N_EMBD],
+            dr: [0.0; T * N_HIDDEN],
             dqkv: [0.0; T * 3 * N_EMBD],
-            dlogits: vec![0.0; vocab_size],
+            dlogits: vec![0.0; T * vocab_size],
             dx0: [0.0; N_EMBD],
         })
     }
@@ -402,8 +458,13 @@ impl Model {
     /// Run positions `from..to` of `tokens` through the model, filling `acts` (including logits).
     /// Positions `< from` must already be present in `acts` (they act as the KV cache), so
     /// training calls this with `from = 0` and generation with `from = pos, to = pos + 1`.
+    ///
+    /// Each layer is applied stage by stage over all `from..to` positions: the linear layers are
+    /// one small matmul over the positions, and only attention and rmsnorm loop per position.
     fn forward(&self, p: &[Float], tokens: &[usize], from: usize, to: usize, a: &mut Acts) {
         const E: usize = N_EMBD;
+        let n = to - from;
+        let rows = from * E..to * E;
         let scale = 1.0 / (HEAD_DIM as Float).sqrt();
 
         // token + position embedding, then rmsnorm (not redundant: gradients flow via residual)
@@ -422,18 +483,13 @@ impl Model {
             let (xs_in, xs_out) = (&lo[l], &mut hi[0]);
             let la = &mut a.layers[l];
             let sh = &self.layers[l];
-            let wqkv = sh.wqkv.view(p);
-            let wo = sh.wo.view(p);
-            let fc1 = sh.fc1.view(p);
-            let fc2 = sh.fc2.view(p);
 
+            // 1) Multi-head attention block
             for i in from..to {
-                let x_in = row(xs_in, i, E);
-
-                // 1) Multi-head attention block
-                let h = row_mut(&mut la.h, i, E);
-                rmsnorm(x_in, h);
-                matvec(wqkv, 3 * E, E, h, row_mut(&mut la.qkv, i, 3 * E));
+                rmsnorm(row(xs_in, i, E), row_mut(&mut la.h, i, E));
+            }
+            matmul_abt(&la.h[rows.clone()], n, E, sh.wqkv.view(p), 3 * E, &mut la.qkv[from * 3 * E..to * 3 * E]);
+            for i in from..to {
                 for hd in 0..N_HEAD {
                     let hs = hd * HEAD_DIM;
                     let q = &la.qkv[i * 3 * E + hs..][..HEAD_DIM];
@@ -453,33 +509,25 @@ impl Model {
                         }
                     }
                 }
-                let x2 = row_mut(&mut la.x2, i, E);
-                matvec(wo, E, E, row(&la.attn_out, i, E), x2);
-                for d in 0..E {
-                    x2[d] += x_in[d];
-                }
-
-                // 2) MLP block
-                let h2 = row_mut(&mut la.h2, i, E);
-                rmsnorm(x2, h2);
-                let r = row_mut(&mut la.r, i, N_HIDDEN);
-                matvec(fc1, N_HIDDEN, E, h2, r);
-                for v in r.iter_mut() {
-                    *v = v.max(0.0);
-                }
-                let x_out = row_mut(xs_out, i, E);
-                matvec(fc2, E, N_HIDDEN, r, x_out);
-                for d in 0..E {
-                    x_out[d] += x2[d];
-                }
             }
+            matmul_abt(&la.attn_out[rows.clone()], n, E, sh.wo.view(p), E, &mut la.x2[rows.clone()]);
+            add_assign(&mut la.x2[rows.clone()], &xs_in[rows.clone()]);
+
+            // 2) MLP block
+            for i in from..to {
+                rmsnorm(row(&la.x2, i, E), row_mut(&mut la.h2, i, E));
+            }
+            let hrows = from * N_HIDDEN..to * N_HIDDEN;
+            matmul_abt(&la.h2[rows.clone()], n, E, sh.fc1.view(p), N_HIDDEN, &mut la.r[hrows.clone()]);
+            for v in la.r[hrows.clone()].iter_mut() {
+                *v = v.max(0.0);
+            }
+            matmul_abt(&la.r[hrows], n, N_HIDDEN, sh.fc2.view(p), E, &mut xs_out[rows.clone()]);
+            add_assign(&mut xs_out[rows.clone()], &la.x2[rows.clone()]);
         }
 
-        let x_final = &a.xs[N_LAYER];
-        let lm_head = self.lm_head.view(p);
-        for i in from..to {
-            matvec(lm_head, self.vocab_size, E, row(x_final, i, E), row_mut(&mut a.logits, i, self.vocab_size));
-        }
+        let v = self.vocab_size;
+        matmul_abt(&a.xs[N_LAYER][rows], n, E, self.lm_head.view(p), v, &mut a.logits[from * v..to * v]);
     }
 
     /// Softmax the first `n` logit rows into `probs` and return the mean cross-entropy loss
@@ -498,59 +546,62 @@ impl Model {
 
     // -----------------------------------------------------------------------------------------
     // Backward pass: accumulates d(loss)/d(params) into `g` for the first `n` positions.
+    // Mirrors the forward stage by stage: every linear layer contributes one dW += dY^T X over
+    // all positions and one dX += dY W, then rmsnorm and attention are walked per position.
     // -----------------------------------------------------------------------------------------
     fn backward(&self, p: &[Float], g: &mut [Float], tokens: &[usize], n: usize, a: &Acts, s: &mut Grads) {
         const E: usize = N_EMBD;
+        const H: usize = N_HIDDEN;
         let v = self.vocab_size;
         let scale = 1.0 / (HEAD_DIM as Float).sqrt();
         let inv_n = 1.0 / n as Float;
 
         // loss = mean_i( -log softmax(logits_i)[target_i] )  =>  dlogits = (probs - onehot) / n
-        s.dx[..n * E].fill(0.0);
-        let x_final = &a.xs[N_LAYER];
-        let lm_head = self.lm_head.view(p);
+        let dl = &mut s.dlogits[..n * v];
+        dl.copy_from_slice(&a.probs[..n * v]);
         for i in 0..n {
-            let dl = &mut s.dlogits;
-            dl.copy_from_slice(row(&a.probs, i, v));
-            dl[tokens[i + 1]] -= 1.0;
-            for x in dl.iter_mut() {
-                *x *= inv_n;
-            }
-            outer_acc(self.lm_head.view_mut(g), v, E, dl, row(x_final, i, E));
-            matvec_t_acc(lm_head, v, E, dl, row_mut(&mut s.dx, i, E));
+            dl[i * v + tokens[i + 1]] -= 1.0;
         }
+        for x in dl.iter_mut() {
+            *x *= inv_n;
+        }
+        let x_final = &a.xs[N_LAYER][..n * E];
+        matmul_atb_acc(dl, n, v, x_final, E, self.lm_head.view_mut(g));
+        s.dx[..n * E].fill(0.0);
+        matmul_ab_acc(dl, n, v, self.lm_head.view(p), E, &mut s.dx[..n * E]);
 
         for l in (0..N_LAYER).rev() {
             let la = &a.layers[l];
             let sh = &self.layers[l];
-            let x_in_all = &a.xs[l];
+            let x_in = &a.xs[l][..n * E];
+            let dx = &mut s.dx[..n * E];
 
-            // s.dx holds d(loss)/d(x_out) where x_out = x2 + fc2(relu(fc1(rmsnorm(x2))))
-            for i in 0..n {
-                let dx = row(&s.dx, i, E);
-                // MLP block
-                let r = row(&la.r, i, N_HIDDEN);
-                outer_acc(sh.fc2.view_mut(g), E, N_HIDDEN, dx, r);
-                s.dr.fill(0.0);
-                matvec_t_acc(sh.fc2.view(p), E, N_HIDDEN, dx, &mut s.dr);
-                for (d, &rv) in s.dr.iter_mut().zip(r) {
-                    if rv <= 0.0 {
-                        *d = 0.0;
-                    }
+            // MLP block: x_out = x2 + fc2(relu(fc1(rmsnorm(x2))));  dx holds d/dx_out
+            let r = &la.r[..n * H];
+            matmul_atb_acc(dx, n, E, r, H, sh.fc2.view_mut(g));
+            let dr = &mut s.dr[..n * H];
+            dr.fill(0.0);
+            matmul_ab_acc(dx, n, E, sh.fc2.view(p), H, dr);
+            for (d, &rv) in dr.iter_mut().zip(r) {
+                if rv <= 0.0 {
+                    *d = 0.0;
                 }
-                outer_acc(sh.fc1.view_mut(g), N_HIDDEN, E, &s.dr, row(&la.h2, i, E));
-                s.dh.fill(0.0);
-                matvec_t_acc(sh.fc1.view(p), N_HIDDEN, E, &s.dr, &mut s.dh);
-                // dx2 = dx (residual) + rmsnorm_bwd
-                let dx2 = row_mut(&mut s.dx2, i, E);
-                dx2.copy_from_slice(dx);
-                rmsnorm_bwd(row(&la.x2, i, E), &s.dh, dx2);
-                // attention output projection: x2 = x_in + wo(attn_out)
-                outer_acc(sh.wo.view_mut(g), E, E, dx2, row(&la.attn_out, i, E));
-                let datt = row_mut(&mut s.datt, i, E);
-                datt.fill(0.0);
-                matvec_t_acc(sh.wo.view(p), E, E, dx2, datt);
             }
+            matmul_atb_acc(dr, n, H, &la.h2[..n * E], E, sh.fc1.view_mut(g));
+            let dh = &mut s.dh[..n * E];
+            dh.fill(0.0);
+            matmul_ab_acc(dr, n, H, sh.fc1.view(p), E, dh);
+            let dx2 = &mut s.dx2[..n * E];
+            dx2.copy_from_slice(dx);
+            for i in 0..n {
+                rmsnorm_bwd(row(&la.x2, i, E), row(dh, i, E), row_mut(dx2, i, E));
+            }
+
+            // attention output projection: x2 = x_in + wo(attn_out)
+            matmul_atb_acc(dx2, n, E, &la.attn_out[..n * E], E, sh.wo.view_mut(g));
+            let datt = &mut s.datt[..n * E];
+            datt.fill(0.0);
+            matmul_ab_acc(dx2, n, E, sh.wo.view(p), E, datt);
 
             // attention core (mixes positions)
             s.dqkv[..n * 3 * E].fill(0.0);
@@ -586,15 +637,16 @@ impl Model {
                 }
             }
 
-            // qkv projection and the pre-attention rmsnorm: x2 = x_in + ...; h = rmsnorm(x_in)
+            // qkv projection and the pre-attention rmsnorm: h = rmsnorm(x_in)
+            let dqkv = &s.dqkv[..n * 3 * E];
+            matmul_atb_acc(dqkv, n, 3 * E, &la.h[..n * E], E, sh.wqkv.view_mut(g));
+            let dh = &mut s.dh[..n * E];
+            dh.fill(0.0);
+            matmul_ab_acc(dqkv, n, 3 * E, sh.wqkv.view(p), E, dh);
+            let dx = &mut s.dx[..n * E];
+            dx.copy_from_slice(&s.dx2[..n * E]);
             for i in 0..n {
-                let dqkv = row(&s.dqkv, i, 3 * E);
-                outer_acc(sh.wqkv.view_mut(g), 3 * E, E, dqkv, row(&la.h, i, E));
-                s.dh.fill(0.0);
-                matvec_t_acc(sh.wqkv.view(p), 3 * E, E, dqkv, &mut s.dh);
-                let dx = row_mut(&mut s.dx, i, E);
-                dx.copy_from_slice(row(&s.dx2, i, E));
-                rmsnorm_bwd(row(x_in_all, i, E), &s.dh, dx);
+                rmsnorm_bwd(row(x_in, i, E), row(dh, i, E), row_mut(dx, i, E));
             }
         }
 
