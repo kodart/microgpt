@@ -1104,6 +1104,38 @@ impl Dataset {
 // multi-threaded results are deterministic only up to floating-point summation order.
 // ---------------------------------------------------------------------------------------------
 
+/// How the learning rate moves from `lr` at step 0 to the end of the run.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Schedule {
+    /// The gist's schedule: straight line down to zero.
+    Linear,
+    /// Half a cosine down to zero: stays near the peak longer, then anneals faster.
+    Cosine,
+    /// No decay at all (reference only).
+    Constant,
+}
+
+impl Schedule {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "linear" => Some(Schedule::Linear),
+            "cosine" => Some(Schedule::Cosine),
+            "constant" => Some(Schedule::Constant),
+            _ => None,
+        }
+    }
+
+    /// Learning-rate multiplier in [0, 1] at `step` of `num_steps`.
+    fn factor(self, step: usize, num_steps: usize) -> Float {
+        let t = step as Float / num_steps as Float;
+        match self {
+            Schedule::Linear => 1.0 - t,
+            Schedule::Cosine => 0.5 * (1.0 + (std::f64::consts::PI as Float * t).cos()),
+            Schedule::Constant => 1.0,
+        }
+    }
+}
+
 struct TrainConfig {
     num_steps: usize,
     batch_size: usize,
@@ -1114,8 +1146,9 @@ struct TrainConfig {
     /// (a 16 KB copy) and evaluated after it ends, so logging does not perturb the timings.
     log_path: Option<String>,
     eval_every: usize,
-    /// Peak learning rate; decays linearly to zero over `num_steps`.
+    /// Peak learning rate, decayed over `num_steps` by `schedule`.
     lr: Float,
+    schedule: Schedule,
 }
 
 /// A float buffer shared between worker threads without a lock.
@@ -1181,6 +1214,7 @@ struct Shared {
     n_threads: usize,
     num_steps: usize,
     lr: Float,
+    schedule: Schedule,
     params: SharedBuf,   // row-major parameters
     params_t: SharedBuf, // transposed layout, read by the forward pass
     m: SharedBuf,        // Adam first moment
@@ -1283,7 +1317,7 @@ impl<'a> Worker<'a> {
     fn update(&self, epoch: usize) {
         let shared = self.shared;
         let step = epoch - 1;
-        let lr_t = shared.lr * (1.0 - step as Float / shared.num_steps as Float); // linear decay
+        let lr_t = shared.lr * shared.schedule.factor(step, shared.num_steps);
         let (c1, c2) = adam_corrections(step + 1);
         let inv_b = 1.0 / shared.batch_size as Float;
         let r = shared.slices[self.w].clone();
@@ -1332,6 +1366,7 @@ fn train(model: &Model, data: &Dataset, params: &mut Vec<Float>, cfg: &TrainConf
         n_threads,
         num_steps,
         lr: cfg.lr,
+        schedule: cfg.schedule,
         params: SharedBuf::new(std::mem::take(params)),
         params_t: SharedBuf::new(params_t),
         m: SharedBuf::new(vec![0.0 as Float; n_params]),
@@ -1455,6 +1490,10 @@ fn main() -> io::Result<()> {
         log_path: std::env::var("MICROGPT_LOG").ok(),
         eval_every: std::env::var("MICROGPT_EVAL_EVERY").ok().and_then(|s| s.parse().ok()).unwrap_or(100),
         lr: std::env::var("MICROGPT_LR").ok().and_then(|s| s.parse().ok()).unwrap_or(LEARNING_RATE),
+        schedule: match std::env::var("MICROGPT_SCHEDULE") {
+            Ok(name) => Schedule::parse(&name).unwrap_or_else(|| panic!("MICROGPT_SCHEDULE must be linear, cosine or constant, got {name:?}")),
+            Err(_) => Schedule::Linear,
+        },
     };
     let mut rng = Rng::new(42); // let there be order among chaos
 
@@ -1478,11 +1517,12 @@ fn main() -> io::Result<()> {
         model.n_params
     );
     println!(
-        "steps: {} | batch size: {} | threads: {} | lr: {} | seed: {}",
+        "steps: {} | batch size: {} | threads: {} | lr: {} ({:?} decay) | seed: {}",
         cfg.num_steps,
         cfg.batch_size,
         cfg.n_threads.clamp(1, cfg.batch_size.max(1)),
         cfg.lr,
+        cfg.schedule,
         seed.map_or("42 (default)".to_string(), |s| s.to_string())
     );
 
@@ -1698,7 +1738,7 @@ mod tests {
         let init = model.init_params(&mut rng);
         let run = |n_threads: usize| {
             let mut params = init.clone();
-            let cfg = TrainConfig { num_steps: 30, batch_size: 5, n_threads, log_path: None, eval_every: 100, lr: LEARNING_RATE };
+            let cfg = TrainConfig { num_steps: 30, batch_size: 5, n_threads, log_path: None, eval_every: 100, lr: LEARNING_RATE, schedule: Schedule::Linear };
             let loss = train(&model, &data, &mut params, &cfg, &mut io::sink()).unwrap();
             (loss, params)
         };

@@ -66,7 +66,8 @@ Knobs, all environment variables so the positional arguments stay `[num_steps] [
 |---|---|---|
 | `MICROGPT_LOG` | unset | write `step,train_time_s,train_loss,eval_loss` to this CSV |
 | `MICROGPT_EVAL_EVERY` | 100 | log interval in steps |
-| `MICROGPT_LR` | 0.01 | peak learning rate (decays linearly to zero) |
+| `MICROGPT_LR` | 0.01 | peak learning rate |
+| `MICROGPT_SCHEDULE` | linear | decay of the learning rate to zero over the run: `linear` (the gist), `cosine`, or `constant` (no decay) |
 | `MICROGPT_SEED` | unset | reseed before parameter init; the data shuffle and held-out split always use seed 42, so losses stay comparable across seeds |
 
 Set `MICROGPT_LOG=<file.csv>` to record `step,train_time_s,train_loss,eval_loss` every
@@ -166,6 +167,11 @@ than one MLP that must serve all of them. The stacked 2-layer, 32-dim, 8-expert 
   0.005 -> 2.119, 0.01 -> 2.122, 0.02 -> 2.162; `64 x 4`: 0.005 -> 2.107, 0.01 -> 2.105, 0.02 -> 2.124).
   Larger batches do not want a larger rate. The single-name recipe prefers a lower one
   (`20000 1 1` at 0.005 -> 2.203 versus 2.223 at 0.01).
+- **Learning-rate schedule:** linear and cosine decay are indistinguishable at the default run
+  (three seeds each: 2.121-2.130 linear, 2.127-2.132 cosine) and cosine is ahead by 0.003-0.006
+  in single-seed 64 x 4 runs, dense and 8-expert alike, which is at the noise floor. No decay at
+  all costs 0.07 (2.195-2.208). The decay to zero is what matters, not its shape; linear stays
+  the default.
 - **Batch size at equal data (640k names):** 8 -> 2.139, 16 -> 2.130, 32 -> 2.119, 64 -> 2.108,
   128 -> 2.109. Larger batches are better per name up to 64 and flat after; with this tiny model
   the noise of small batches costs more than the extra updates gain.

@@ -157,6 +157,7 @@
       </div>
     </div>
     <p style="margin-top:14px">Two results that went against the usual intuition. At equal data, <em>larger</em> batches win: the one-name-per-step recipe updates most often but its gradients are so noisy that the extra updates are worth less than the noise costs, and the trend only flattens at 64. And larger batches do not want a larger learning rate: 0.01 is already the optimum for 16- and 64-name batches, with every higher rate strictly worse. The batched runs are noise-limited, not step-limited. The one recipe that does want a change is the gist's own, which improves from 2.223 to 2.203 at a rate of 0.005.</p>
+    <p>The shape of the decay was tested too, with a <code>MICROGPT_SCHEDULE</code> knob. Linear and cosine decay to zero are indistinguishable at the default run over three seeds (2.121-2.130 against 2.127-2.132), and cosine leads by 0.003-0.006 in single-seed 64 x 4 runs, dense and 8-expert alike, which is within noise. A constant rate with no decay costs 0.07. So the annealing to zero is what matters, not its shape, and linear stays the default.</p>
     <p>Four seeds of the default run end at 2.120, 2.122, 2.123 and 2.130, and re-running one configuration moves it by up to 0.007 through thread summation order alone. Differences under about 0.01 in any table here are noise; the batch-size and model-size effects are several times that.</p>
   </section>
 
