@@ -1,0 +1,346 @@
+<title>microgpt Rust Report</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    color-scheme: light;
+    --page: #f7f7f4; --surface-1: #fcfcfb; --text-primary: #0b0b0b; --text-secondary: #52514e; --muted: #898781;
+    --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,0.10); --chip: #efeee9; --tip-bg: #ffffff;
+    --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a; --series-4: #eda100; --series-5: #e87ba4;
+    --wash-1: rgba(42,120,214,0.10);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --page: #0d0d0d; --surface-1: #1a1a19; --text-primary: #ffffff; --text-secondary: #c3c2b7; --muted: #898781;
+      --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10); --chip: #2a2a28; --tip-bg: #242422;
+      --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500; --series-5: #d55181;
+      --wash-1: rgba(57,135,229,0.12);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface-1: #1a1a19; --text-primary: #ffffff; --text-secondary: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10); --chip: #2a2a28; --tip-bg: #242422;
+    --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500; --series-5: #d55181;
+    --wash-1: rgba(57,135,229,0.12);
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--page); color: var(--text-primary); font-family: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 15px; line-height: 1.55; }
+  main { max-width: 1000px; margin: 0 auto; padding: 44px 24px 64px; display: flex; flex-direction: column; gap: 40px; }
+  header h1 { font-size: 30px; font-weight: 600; margin: 0 0 8px; letter-spacing: -0.015em; text-wrap: balance; }
+  header .lede { margin: 0; color: var(--text-secondary); max-width: 66ch; font-size: 16px; }
+  .eyebrow { font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 10px; }
+  h2 { font-size: 21px; font-weight: 600; margin: 0 0 8px; letter-spacing: -0.01em; text-wrap: balance; }
+  h3 { font-size: 16px; font-weight: 600; margin: 22px 0 6px; }
+  p { margin: 0 0 12px; max-width: 72ch; }
+  p.wide { max-width: none; }
+  a { color: var(--series-1); }
+  code { font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace; font-size: 0.92em; background: var(--chip); padding: 1px 5px; border-radius: 4px; }
+  pre { font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace; font-size: 13px; background: var(--chip); padding: 12px 14px; border-radius: 6px; overflow-x: auto; margin: 8px 0 14px; }
+  .mono { font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace; }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-top: 22px; }
+  .tile { background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; display: flex; flex-direction: column; gap: 3px; }
+  .tile .label { font-size: 13px; color: var(--text-secondary); }
+  .tile .value { font-size: 30px; font-weight: 600; line-height: 1.1; }
+  .tile .sub { font-size: 13px; color: var(--muted); }
+
+  .card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px; padding: 18px 20px 14px; }
+  .card h3 { margin-top: 0; }
+  .legend { display: flex; gap: 18px; flex-wrap: wrap; font-size: 13px; color: var(--text-secondary); margin: 0 0 6px; }
+  .legend .item { display: flex; align-items: center; gap: 8px; }
+  .key { display: inline-block; width: 16px; height: 0; border-top: 2px solid; border-radius: 2px; vertical-align: middle; }
+  .key.dash { border-top-style: dashed; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; }
+  .s1 { border-color: var(--series-1); background: var(--series-1); } .s2 { border-color: var(--series-2); background: var(--series-2); }
+  .s3 { border-color: var(--series-3); background: var(--series-3); } .s4 { border-color: var(--series-4); background: var(--series-4); }
+  .s5 { border-color: var(--series-5); background: var(--series-5); } .key { background: none !important; }
+  .key.gray { border-color: var(--axis); }
+
+  .plot-wrap { position: relative; }
+  svg.plot { width: 100%; height: auto; display: block; overflow: visible; }
+  svg text { font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace; font-size: 11.5px; fill: var(--muted); }
+  svg .axis-title { fill: var(--text-secondary); font-family: "IBM Plex Sans", system-ui, sans-serif; font-size: 12px; }
+  svg .grid { stroke: var(--grid); stroke-width: 1; } svg .baseline { stroke: var(--axis); stroke-width: 1; }
+  svg .line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  svg .line.dash { stroke-dasharray: 5 5; } svg .line.gray { stroke: var(--axis); }
+  svg .line.s1 { stroke: var(--series-1); } svg .line.s2 { stroke: var(--series-2); } svg .line.s3 { stroke: var(--series-3); } svg .line.s4 { stroke: var(--series-4); } svg .line.s5 { stroke: var(--series-5); }
+  svg .dot { stroke: var(--surface-1); stroke-width: 2; }
+  svg .dot.s1 { fill: var(--series-1); } svg .dot.s2 { fill: var(--series-2); } svg .dot.s3 { fill: var(--series-3); } svg .dot.s4 { fill: var(--series-4); } svg .dot.s5 { fill: var(--series-5); }
+  svg .bar { fill: var(--series-1); } svg .bar.hl { fill: var(--series-2); }
+  svg .label { fill: var(--text-primary); font-family: "IBM Plex Sans", system-ui, sans-serif; font-size: 12px; font-weight: 500; }
+  svg .crosshair { stroke: var(--axis); stroke-width: 1; pointer-events: none; }
+  svg .hit { fill: transparent; }
+  .tooltip { position: absolute; pointer-events: none; background: var(--tip-bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font-size: 13px; box-shadow: 0 4px 16px rgba(0,0,0,0.12); min-width: 150px; z-index: 2; }
+  .tooltip .x { color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+  .tooltip .row { display: flex; align-items: center; gap: 8px; } .tooltip .row .v { font-weight: 600; min-width: 52px; } .tooltip .row .n { color: var(--text-secondary); }
+  .note { font-size: 13px; color: var(--muted); margin: 8px 0 0; max-width: 80ch; }
+
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; margin: 6px 0 14px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+  th { color: var(--text-secondary); font-weight: 500; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td strong { font-weight: 600; }
+  .table-wrap { overflow-x: auto; }
+  details { margin-top: 10px; } details summary { cursor: pointer; color: var(--text-secondary); font-size: 14px; }
+
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 760px) { .two { grid-template-columns: 1fr; } }
+  ul { margin: 0 0 12px; padding-left: 20px; max-width: 72ch; } li { margin-bottom: 6px; }
+  .samples { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 4px 14px; font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace; font-size: 14px; color: var(--text-secondary); max-width: 720px; }
+  .callout { border-left: 3px solid var(--series-1); background: var(--wash-1); padding: 10px 14px; border-radius: 0 6px 6px 0; max-width: 72ch; }
+  .callout p:last-child { margin-bottom: 0; }
+</style>
+
+<main>
+  <header>
+    <div class="eyebrow">microgpt · Rust port · Apple M1 Pro · September 2026</div>
+    <h1>The gist's GPT, 8,000x faster, and what that speed let us learn</h1>
+    <p class="lede">Karpathy's <code>microgpt.py</code> trains a 4,192-parameter character-level GPT on 32,033 names with a scalar autograd engine. This port keeps the maths and drops the engine. The wall-clock savings were then spent on the sweeps below: batch size, threads, learning rate, seeds and model size, each judged on the same 1,000 held-out names.</p>
+    <div class="tiles">
+      <div class="tile"><div class="label">Gist recipe, Python (1000 steps)</div><div class="value">109 s</div><div class="sub">CPython 3, scalar autograd</div></div>
+      <div class="tile"><div class="label">Gist recipe, this port</div><div class="value">13 ms</div><div class="sub">same model, same steps, one thread</div></div>
+      <div class="tile"><div class="label">Default run, held-out loss</div><div class="value">2.122</div><div class="sub">20000 steps x 16 names, 4 threads, 1.1 s</div></div>
+      <div class="tile"><div class="label">Best run, held-out loss</div><div class="value">2.031</div><div class="sub">2 layers, 32-dim, 10500 x 64, 11 s</div></div>
+    </div>
+  </header>
+
+  <section>
+    <div class="eyebrow">01 · What changed</div>
+    <h2>Same maths, no graph</h2>
+    <p>The Python version allocates a <code>Value</code> node for every add and multiply and walks that graph backwards; that is essentially all of its runtime. The port derives the backward pass by hand for each op and runs it as loops over flat <code>f32</code> buffers. Everything else is bookkeeping around that. Each row below was measured in isolation, in the order it was added.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Change</th><th>What it does</th><th class="num">Measured effect</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Hand-derived vector backward</strong></td><td>Explicit backward kernels for embedding, rmsnorm, fused QKV, causal softmax attention, output projection, ReLU MLP, LM head and cross-entropy. Parameters, gradients and Adam moments are four flat vectors.</td><td class="num">109 s → 20 ms</td></tr>
+        <tr><td><strong>Fixed-size activation arrays</strong></td><td>Activations and backward scratch are inline arrays in one boxed struct instead of separate heap <code>Vec</code>s. With <code>Vec</code>s reached through a reference, LLVM cannot prove the buffers are disjoint and emits ~25% fewer vector ops plus spills. This cost a day's worth of bisecting to find.</td><td class="num">15.9 → 12.5 µs per name</td></tr>
+        <tr><td><strong>Vector FMA kernels</strong></td><td>Every accumulate uses <code>mul_add</code>; the dot product keeps four independent lanes. Rust neither contracts <code>a*b+c</code> nor reassociates float sums, so the hot loop had 602 multiplies and 600 adds and now has 568 fused multiply-adds. A serial FMA chain was <em>slower</em> (latency-bound); the lanes are what matters.</td><td class="num">12.2 → 10.6 µs per name</td></tr>
+        <tr><td><strong>Minibatches over a worker pool</strong></td><td>Workers claim names from an atomic counter and accumulate into private gradient buffers; the main thread reduces, runs Adam and publishes the next step on an atomic epoch. Spin-then-yield waits, because a step is tens of microseconds and channel wake-ups cost more than the compute.</td><td class="num">3.2x at 4 threads, 5x at 8</td></tr>
+        <tr><td><strong>Build flags</strong></td><td>Fat LTO, one codegen unit, <code>panic=abort</code>, <code>target-cpu=native</code>.</td><td class="num">baseline</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note">Per-name costs are single-thread, 32 names per step. The KV cache for sampling comes for free: the stored K/V rows of the activation buffer are the cache, and generation runs one new position against them.</p>
+  </section>
+
+  <section>
+    <div class="eyebrow">02 · Threads</div>
+    <h2>Scaling flattens early, and eight threads are fragile</h2>
+    <div class="card">
+      <h3>Time per optimizer step, 32 names per step</h3>
+      <div class="legend" id="lg-threads"></div>
+      <div class="plot-wrap"><svg class="plot" id="ch-threads" viewBox="0 0 1000 380" role="img"><title>Step time against thread count</title></svg><div class="tooltip" hidden></div></div>
+      <p class="note">Quiet-machine measurements, 20000 steps. Ten-thread runs are omitted: on this 8-performance + 2-efficiency-core CPU they were 1.6 to 3x slower than eight and never repeatable.</p>
+      <details><summary>Table view</summary><div class="table-wrap"><table id="tb-threads"></table></div></details>
+    </div>
+    <p style="margin-top:14px">A 32-name step is under 40 µs of arithmetic on eight cores; the barrier plus reduce-and-Adam is another 25 to 30 µs and does not shrink with threads. That fixed cost is why the curve bends. It is also why eight threads are a bad default: with all performance cores busy, any other process (a browser, or macOS's Gatekeeper scanning freshly built binaries, which happened repeatedly during this work) turned 1.5 s runs into 3 to 8 s, while 4-thread runs stayed at 1.1 s throughout. Six threads are about 20% faster than four on a quiet machine and are worth passing explicitly.</p>
+  </section>
+
+  <section>
+    <div class="eyebrow">03 · Batch size</div>
+    <h2>Larger batches learn more per name, up to 64</h2>
+    <div class="two">
+      <div class="card">
+        <h3>Held-out loss after 640k names, by batch size</h3>
+        <div class="plot-wrap"><svg class="plot" id="ch-batch" viewBox="0 0 480 340" role="img"><title>Held-out loss by batch size at equal data</title></svg><div class="tooltip" hidden></div></div>
+        <p class="note">Steps x batch = 640,000 for every bar (80000 x 8 … 5000 x 128). 4 threads, learning rate 0.01.</p>
+        <details><summary>Table view</summary><div class="table-wrap"><table id="tb-batch"></table></div></details>
+      </div>
+      <div class="card">
+        <h3>Held-out loss by peak learning rate, 20000 steps</h3>
+        <div class="legend" id="lg-lr"></div>
+        <div class="plot-wrap"><svg class="plot" id="ch-lr" viewBox="0 0 480 340" role="img"><title>Held-out loss by learning rate</title></svg><div class="tooltip" hidden></div></div>
+        <p class="note">Rate decays linearly to zero over the run. Log-scaled x axis.</p>
+        <details><summary>Table view</summary><div class="table-wrap"><table id="tb-lr"></table></div></details>
+      </div>
+    </div>
+    <p style="margin-top:14px">Two results that went against the usual intuition. At equal data, <em>larger</em> batches win: the one-name-per-step recipe updates most often but its gradients are so noisy that the extra updates are worth less than the noise costs, and the trend only flattens at 64. And larger batches do not want a larger learning rate: 0.01 is already the optimum for 16- and 64-name batches, with every higher rate strictly worse. The batched runs are noise-limited, not step-limited. The one recipe that does want a change is the gist's own, which improves from 2.223 to 2.203 at a rate of 0.005.</p>
+    <p>Four seeds of the default run end at 2.120, 2.122, 2.123 and 2.130. Differences under about 0.01 in any table here are noise; the batch-size and model-size effects are several times that.</p>
+  </section>
+
+  <section>
+    <div class="eyebrow">04 · Time versus loss</div>
+    <h2>The batched runs on the clock</h2>
+    <p>The interactive comparison of held-out loss against training wall-clock time lives in its own page: <a href="https://claude.ai/code/artifact/55f555eb-9667-429a-b9bb-dce816fa94c5">microgpt Training Race</a>. It covers the gist's recipe, the same recipe given the batched runs' time budget, and 32 x 8, 16 x 4, 32 x 4 and 64 x 4 minibatches, with axes switchable between time, steps and names seen.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Run</th><th class="num">Training time</th><th class="num">Held-out loss</th><th class="num">Time to reach 2.30</th></tr></thead>
+      <tbody>
+        <tr><td>Gist recipe, 20000 x 1, 1 thread</td><td class="num">0.26 s</td><td class="num">2.231</td><td class="num">0.136 s</td></tr>
+        <tr><td>Same recipe, 291000 steps (equal time)</td><td class="num">3.61 s</td><td class="num">2.232</td><td class="num"></td></tr>
+        <tr><td>32 names x 8 threads</td><td class="num">1.33 s</td><td class="num">2.118</td><td class="num">0.024 s</td></tr>
+        <tr><td>16 names x 4 threads (default)</td><td class="num">1.18 s</td><td class="num">2.122</td><td class="num">0.030 s</td></tr>
+        <tr><td>32 names x 4 threads</td><td class="num">2.00 s</td><td class="num">2.112</td><td class="num">0.033 s</td></tr>
+        <tr><td>64 names x 4 threads</td><td class="num">3.73 s</td><td class="num">2.105</td><td class="num">0.038 s</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note">The single-name recipe given nine passes over the data ends no better than after one: with this learning rate schedule it stops improving after a few epochs, while the batched runs keep improving.</p>
+  </section>
+
+  <section>
+    <div class="eyebrow">05 · Model size</div>
+    <h2>Capacity was the real limit</h2>
+    <div class="card">
+      <h3>Held-out loss by time budget, four model shapes</h3>
+      <div class="legend" id="lg-model"></div>
+      <div class="plot-wrap"><svg class="plot" id="ch-model" viewBox="0 0 1000 380" role="img"><title>Held-out loss against time budget for four model shapes</title></svg><div class="tooltip" hidden></div></div>
+      <p class="note">4 threads. Steps and batch were chosen per model to land on each budget; the exact recipes are in the table. Log-scaled x axis.</p>
+      <details><summary>Table view</summary><div class="table-wrap"><table id="tb-model"></table></div></details>
+    </div>
+    <p style="margin-top:14px">Every larger shape beats the gist's model at every budget, including the one-second budget where the bigger models get a fraction of the steps. The 32-dimensional single layer is the best buy up to a few seconds and then saturates near 2.055; the 2-layer 32-dimensional model keeps improving and wins once ten seconds are affordable. Model shape is a build-time choice because the activation buffers are fixed-size arrays:</p>
+    <pre>MICROGPT_N_EMBD=32 MICROGPT_N_LAYER=2 cargo build --release</pre>
+    <h3>Twenty names from the best model</h3>
+    <p class="note" style="margin-bottom:8px">2 layers, 32-dim, 10500 steps x 64 names, temperature 0.5. None of these are in the dataset's training split.</p>
+    <div class="samples" id="samples"></div>
+  </section>
+
+  <section>
+    <div class="eyebrow">06 · Recommendations</div>
+    <h2>What to run</h2>
+    <div class="callout">
+      <p><strong>Want a second of training:</strong> the 32-dim single layer at 6700 x 16 on 4 threads reaches 2.104 in 1.1 s, better than the gist's shape gets in any amount of time at this recipe.</p>
+      <p><strong>Want the lowest loss:</strong> the 2-layer 32-dim model at 64 names per step, 4 threads. 2.035 in 11 s, and still improving with more steps.</p>
+      <p><strong>Leave the learning rate at 0.01</strong> for any batched run; lower it to 0.005 only for the one-name recipe. Use 6 threads instead of 4 when nothing else is running.</p>
+    </div>
+    <h3>Not worth pursuing</h3>
+    <ul>
+      <li><strong>FP16, FP8, FP4.</strong> The whole model is 16 to 100 KB and lives in L1 cache, so the bandwidth these formats save is not the bottleneck; fp16 arithmetic would at best halve the compute part of a step (a 1.6x ceiling at 16 x 4), needs nightly Rust, and underflows Adam's second moment outright. FP8 and FP4 have no CPU arithmetic at all.</li>
+      <li><strong>More than 8 threads, or batches above 128.</strong> Both measured worse.</li>
+    </ul>
+    <h3>Next real speed-up</h3>
+    <p>Training still processes the sixteen positions of a name one at a time, so each weight gradient is a rank-1 update streamed through the gradient buffer sixteen times per name. Running the linear layers over all positions at once, as small matrix multiplies with the weight gradient accumulated once per name, would cut that traffic sixteen-fold and let the compiler register-tile. Expect 1.5 to 2.5x on the kernels.</p>
+  </section>
+
+  <section>
+    <div class="eyebrow">07 · Method</div>
+    <h2>How the numbers were taken</h2>
+    <ul>
+      <li><strong>Held-out loss</strong> is the mean cross-entropy over the last 1,000 names of the seed-42 shuffle, which are never trained on. Every configuration is scored on the same names. Training-batch losses are not compared across batch sizes.</li>
+      <li><strong>Timing</strong> is training wall-clock only. Loss logging snapshots the parameters (16 KB) during training and evaluates them afterwards; an earlier inline evaluator slowed the 8-thread run by 75% by disturbing the worker scheduling and was replaced.</li>
+      <li><strong>Correctness</strong> rests on an f64 finite-difference gradient check over a few hundred parameters (max relative error under 1e-4, run for all four model shapes), an incremental-versus-full forward equivalence test for the KV cache, and a check that 1-thread and 3-thread training produce the same parameters to 1e-9.</li>
+      <li><strong>Machine:</strong> Apple M1 Pro, 8 performance + 2 efficiency cores, Rust 1.97 stable. The Python baseline is CPython 3 on the same laptop. The RNG is xoshiro256** and does not reproduce Python's stream, so exact losses differ from the gist.</li>
+      <li><strong>Code:</strong> <code>src/main.rs</code> (about 1,200 lines including tests), <code>build.rs</code> for the model shape, <code>docs/loss-curves.html</code> and <code>docs/loss-logs/</code> for the recorded runs.</li>
+    </ul>
+  </section>
+</main>
+
+<script>
+const NS = "http://www.w3.org/2000/svg";
+function el(name, attrs, parent) { const e = document.createElementNS(NS, name); for (const k in attrs) e.setAttribute(k, attrs[k]); if (parent) parent.appendChild(e); return e; }
+function niceTicks(lo, hi, n) {
+  const span = hi - lo, raw = span / n, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => span / s <= n) || 10 * mag;
+  const out = []; for (let v = Math.ceil(lo / step - 1e-9) * step; v <= hi + 1e-9; v += step) out.push(+v.toFixed(10)); return out;
+}
+function legend(id, series) {
+  const lg = document.getElementById(id); lg.textContent = "";
+  for (const s of series) { const it = document.createElement("div"); it.className = "item"; const k = document.createElement("span"); k.className = "key " + s.cls; const t = document.createElement("span"); t.textContent = s.name; it.append(k, t); lg.appendChild(it); }
+}
+function table(id, head, rows) {
+  const tb = document.getElementById(id); tb.textContent = "";
+  const thead = document.createElement("thead"); const hr = document.createElement("tr");
+  head.forEach((h, i) => { const th = document.createElement("th"); th.textContent = h; if (i) th.className = "num"; hr.appendChild(th); }); thead.appendChild(hr); tb.appendChild(thead);
+  const body = document.createElement("tbody");
+  for (const r of rows) { const tr = document.createElement("tr"); r.forEach((v, i) => { const td = document.createElement("td"); td.textContent = v; if (i) td.className = "num"; tr.appendChild(td); }); body.appendChild(tr); }
+  tb.appendChild(body);
+}
+
+// Generic line chart: series = [{name, cls, pts:[[x,y]], dash?, labelEnd?}], opts = {x:{label, log, fmt, ticks}, y:{label, lo, hi, fmt}}
+function lineChart(svgId, series, opts) {
+  const svg = document.getElementById(svgId); const tip = svg.parentElement.querySelector(".tooltip");
+  const W = +svg.getAttribute("viewBox").split(" ")[2], H = +svg.getAttribute("viewBox").split(" ")[3];
+  const M = { top: 16, right: opts.right || 60, bottom: 44, left: 56 }; const PW = W - M.left - M.right, PH = H - M.top - M.bottom;
+  const xs = series.flatMap(s => s.pts.map(p => p[0]));
+  const xlo = opts.x.lo ?? Math.min(...xs), xhi = opts.x.hi ?? Math.max(...xs);
+  const tx = opts.x.log ? Math.log10 : (v => v);
+  const x = v => M.left + (tx(v) - tx(xlo)) / (tx(xhi) - tx(xlo)) * PW;
+  const y = v => M.top + (1 - (v - opts.y.lo) / (opts.y.hi - opts.y.lo)) * PH;
+  for (const t of niceTicks(opts.y.lo, opts.y.hi, 6)) { el("line", { class: "grid", x1: M.left, x2: M.left + PW, y1: y(t), y2: y(t) }, svg); const l = el("text", { x: M.left - 8, y: y(t) + 4, "text-anchor": "end" }, svg); l.textContent = opts.y.fmt(t); }
+  el("line", { class: "baseline", x1: M.left, x2: M.left + PW, y1: M.top + PH, y2: M.top + PH }, svg);
+  for (const t of (opts.x.ticks || niceTicks(xlo, xhi, 8))) { const l = el("text", { x: x(t), y: M.top + PH + 18, "text-anchor": "middle" }, svg); l.textContent = opts.x.fmt(t); }
+  const xt = el("text", { class: "axis-title", x: M.left + PW / 2, y: H - 6, "text-anchor": "middle" }, svg); xt.textContent = opts.x.label;
+  const yt = el("text", { class: "axis-title", x: 14, y: M.top + PH / 2, "text-anchor": "middle", transform: `rotate(-90 14 ${M.top + PH / 2})` }, svg); yt.textContent = opts.y.label;
+  const ends = [];
+  for (const s of series) {
+    const d = s.pts.map((p, i) => (i ? "L" : "M") + x(p[0]).toFixed(1) + " " + y(p[1]).toFixed(1)).join(" ");
+    el("path", { class: "line " + s.cls + (s.dash ? " dash" : ""), d }, svg);
+    if (!s.noDots) for (const p of s.pts) el("circle", { class: "dot " + s.cls, cx: x(p[0]), cy: y(p[1]), r: 4 }, svg);
+    if (s.labelEnd) { const p = s.pts[s.pts.length - 1]; ends.push({ lx: x(p[0]), ly: y(p[1]), text: s.labelEnd(p) }); }
+  }
+  ends.sort((a, b) => a.ly - b.ly); let prev = -Infinity;
+  for (const e of ends) { e.ty = Math.max(e.ly, prev + 15); prev = e.ty; }
+  for (const e of ends) { if (Math.abs(e.ty - e.ly) > 1) el("line", { class: "grid", x1: e.lx + 6, y1: e.ly, x2: M.left + PW + 8, y2: e.ty }, svg); const l = el("text", { class: "label", x: M.left + PW + 12, y: e.ty + 4 }, svg); l.textContent = e.text; }
+  // hover: crosshair snapping to nearest x among all points
+  const allX = [...new Set(xs)].sort((a, b) => a - b);
+  const cross = el("line", { class: "crosshair", y1: M.top, y2: M.top + PH, visibility: "hidden" }, svg);
+  const hit = el("rect", { class: "hit", x: M.left, y: M.top, width: PW, height: PH }, svg);
+  hit.addEventListener("pointermove", ev => {
+    const r = svg.getBoundingClientRect(); const px = (ev.clientX - r.left) / r.width * W;
+    let best = allX[0], bd = Infinity; for (const v of allX) { const d = Math.abs(x(v) - px); if (d < bd) { bd = d; best = v; } }
+    cross.setAttribute("x1", x(best)); cross.setAttribute("x2", x(best)); cross.setAttribute("visibility", "visible");
+    tip.textContent = ""; const h = document.createElement("div"); h.className = "x"; h.textContent = opts.x.tip ? opts.x.tip(best) : opts.x.fmt(best); tip.appendChild(h);
+    for (const s of series) { if (s.hideTip) continue; const p = s.pts.find(p => p[0] === best); const row = document.createElement("div"); row.className = "row"; const k = document.createElement("span"); k.className = "key " + s.cls + (s.dash ? " dash" : ""); const v = document.createElement("span"); v.className = "v"; v.textContent = p ? opts.y.fmt(p[1]) : "–"; const n = document.createElement("span"); n.className = "n"; n.textContent = s.name; row.append(k, v, n); tip.appendChild(row); }
+    tip.hidden = false; const wrap = svg.parentElement.getBoundingClientRect(); const left = x(best) / W * wrap.width;
+    tip.style.left = (left + 14 + tip.offsetWidth > wrap.width ? left - tip.offsetWidth - 14 : left + 14) + "px"; tip.style.top = "20px";
+  });
+  hit.addEventListener("pointerleave", () => { cross.setAttribute("visibility", "hidden"); tip.hidden = true; });
+}
+
+function barChart(svgId, bars, opts) {
+  const svg = document.getElementById(svgId); const tip = svg.parentElement.querySelector(".tooltip");
+  const W = +svg.getAttribute("viewBox").split(" ")[2], H = +svg.getAttribute("viewBox").split(" ")[3];
+  const M = { top: 16, right: 16, bottom: 44, left: 56 }; const PW = W - M.left - M.right, PH = H - M.top - M.bottom;
+  const y = v => M.top + (1 - (v - opts.y.lo) / (opts.y.hi - opts.y.lo)) * PH;
+  for (const t of niceTicks(opts.y.lo, opts.y.hi, 6)) { el("line", { class: "grid", x1: M.left, x2: M.left + PW, y1: y(t), y2: y(t) }, svg); const l = el("text", { x: M.left - 8, y: y(t) + 4, "text-anchor": "end" }, svg); l.textContent = opts.y.fmt(t); }
+  el("line", { class: "baseline", x1: M.left, x2: M.left + PW, y1: M.top + PH, y2: M.top + PH }, svg);
+  const yt = el("text", { class: "axis-title", x: 14, y: M.top + PH / 2, "text-anchor": "middle", transform: `rotate(-90 14 ${M.top + PH / 2})` }, svg); yt.textContent = opts.y.label;
+  const xt = el("text", { class: "axis-title", x: M.left + PW / 2, y: H - 6, "text-anchor": "middle" }, svg); xt.textContent = opts.x.label;
+  const slot = PW / bars.length, bw = Math.min(24, slot * 0.6);
+  bars.forEach((b, i) => {
+    const cx = M.left + slot * (i + 0.5), top = y(b.value), base = M.top + PH;
+    const r = 4, h = base - top;
+    const d = `M${cx - bw / 2} ${base} V${top + r} a${r} ${r} 0 0 1 ${r} -${r} h${bw - 2 * r} a${r} ${r} 0 0 1 ${r} ${r} V${base} Z`;
+    const path = el("path", { class: "bar" + (b.hl ? " hl" : ""), d: h > r ? d : `M${cx - bw / 2} ${base} h${bw} v-${h} h-${bw} Z` }, svg);
+    const lab = el("text", { x: cx, y: M.top + PH + 18, "text-anchor": "middle" }, svg); lab.textContent = b.label;
+    if (b.direct) { const v = el("text", { class: "label", x: cx, y: top - 6, "text-anchor": "middle" }, svg); v.textContent = opts.y.fmt(b.value); }
+    const hit = el("rect", { class: "hit", x: M.left + slot * i, y: M.top, width: slot, height: PH }, svg);
+    hit.addEventListener("pointerenter", () => { path.style.opacity = 0.75; tip.textContent = ""; const hh = document.createElement("div"); hh.className = "x"; hh.textContent = b.tip || b.label; tip.appendChild(hh); const row = document.createElement("div"); row.className = "row"; const v = document.createElement("span"); v.className = "v"; v.textContent = opts.y.fmt(b.value); const n = document.createElement("span"); n.className = "n"; n.textContent = opts.y.short; row.append(v, n); tip.appendChild(row); tip.hidden = false; const wrap = svg.parentElement.getBoundingClientRect(); const left = cx / W * wrap.width; tip.style.left = (left + 14 + tip.offsetWidth > wrap.width ? left - tip.offsetWidth - 14 : left + 14) + "px"; tip.style.top = "20px"; });
+    hit.addEventListener("pointerleave", () => { path.style.opacity = 1; tip.hidden = true; });
+  });
+}
+
+// ---- data
+const THREADS = [[1, 340], [3, 126], [4, 97], [5, 85], [6, 76], [8, 66]];
+const ideal = THREADS.map(([t]) => [t, 340 / t]);
+lineChart("ch-threads", [
+  { name: "Measured, 32 names per step", cls: "s1", pts: THREADS, labelEnd: p => p[1] + " µs at " + p[0] + " threads" },
+  { name: "Perfect scaling (340 µs / threads)", cls: "gray", pts: ideal, dash: true, noDots: true, labelEnd: p => Math.round(p[1]) + " µs ideal" },
+], { right: 150, x: { label: "Threads", fmt: v => v, ticks: [1, 2, 3, 4, 5, 6, 7, 8], tip: v => v + " thread" + (v > 1 ? "s" : "") }, y: { label: "µs per step", lo: 0, hi: 350, fmt: v => Math.round(v) } });
+legend("lg-threads", [{ name: "Measured, 32 names per step", cls: "s1" }, { name: "Perfect scaling", cls: "gray dash" }]);
+table("tb-threads", ["Threads", "µs per step", "Speed-up", "Ideal speed-up"], THREADS.map(([t, us]) => [t, us, (340 / us).toFixed(2) + "x", t + "x"]));
+
+const BATCH = [[8, 2.139, "80000 x 8"], [16, 2.130, "40000 x 16"], [32, 2.119, "20000 x 32"], [64, 2.108, "10000 x 64"], [128, 2.109, "5000 x 128"]];
+barChart("ch-batch", BATCH.map(([b, v, r]) => ({ label: String(b), value: v, tip: r + " names", direct: true, hl: b === 64 })), { x: { label: "Names per step" }, y: { label: "Held-out loss", short: "held-out loss", lo: 2.08, hi: 2.16, fmt: v => v.toFixed(3) } });
+table("tb-batch", ["Batch", "Steps", "Held-out loss", "Time"], [[8, "80000", "2.139", "2.83 s"], [16, "40000", "2.130", "2.17 s"], [32, "20000", "2.119", "1.97 s"], [64, "10000", "2.108", "1.84 s"], [128, "5000", "2.109", "2.03 s"]]);
+
+const LR16 = [[0.0025, 2.135], [0.005, 2.119], [0.01, 2.122], [0.02, 2.162], [0.03, 2.2005], [0.05, 2.268]];
+const LR64 = [[0.0025, 2.119], [0.005, 2.107], [0.01, 2.105], [0.02, 2.124], [0.03, 2.1465], [0.05, 2.198]];
+lineChart("ch-lr", [
+  { name: "16 names x 4 threads", cls: "s1", pts: LR16 },
+  { name: "64 names x 4 threads", cls: "s2", pts: LR64 },
+], { right: 16, x: { label: "Peak learning rate", log: true, fmt: v => String(v), ticks: [0.0025, 0.005, 0.01, 0.02, 0.05], tip: v => "lr " + v }, y: { label: "Held-out loss", lo: 2.08, hi: 2.28, fmt: v => v.toFixed(2) } });
+legend("lg-lr", [{ name: "16 names x 4 threads", cls: "s1" }, { name: "64 names x 4 threads", cls: "s2" }]);
+table("tb-lr", ["Learning rate", "16 x 4", "64 x 4"], LR16.map(([lr, v], i) => [lr, v.toFixed(3), LR64[i][1].toFixed(3)]));
+
+const MODELS = [
+  { name: "1 layer, 16-dim (gist)", cls: "s1", params: "4,192", pts: [[1.11, 2.122, "20000 x 16"], [3.63, 2.100, "20000 x 64"]] },
+  { name: "1 layer, 32-dim", cls: "s2", params: "14,528", pts: [[1.11, 2.104, "6700 x 16"], [3.63, 2.057, "6600 x 64"], [10.95, 2.055, "20000 x 64"]] },
+  { name: "2 layers, 16-dim", cls: "s3", params: "7,264", pts: [[1.11, 2.107, "11500 x 16"], [3.43, 2.090, "20000 x 32"], [12.83, 2.056, "20000 x 128"]] },
+  { name: "2 layers, 32-dim", cls: "s4", params: "26,816", pts: [[1.09, 2.108, "3500 x 16"], [3.51, 2.071, "11500 x 16"], [10.94, 2.035, "10500 x 64"]] },
+];
+lineChart("ch-model", MODELS.map(m => ({ name: m.name, cls: m.cls, pts: m.pts.map(p => [p[0], p[1]]), labelEnd: p => p[1].toFixed(3) + "  " + m.name.replace(" (gist)", "") })),
+  { right: 190, x: { label: "Training time budget (s)", log: true, lo: 1, hi: 13, fmt: v => v, ticks: [1, 2, 3, 5, 10], tip: v => "≈ " + v + " s" }, y: { label: "Held-out loss", lo: 2.02, hi: 2.14, fmt: v => v.toFixed(2) } });
+legend("lg-model", MODELS.map(m => ({ name: m.name, cls: m.cls })));
+table("tb-model", ["Model", "Params", "~1.1 s", "~3.6 s", "~11 s"], MODELS.map(m => [m.name, m.params, ...[0, 1, 2].map(i => m.pts[i] ? m.pts[i][1].toFixed(3) + " (" + m.pts[i][2] + ")" : "")]));
+
+const SAMPLES = ["rhyan", "jaire", "kensly", "kameer", "jessin", "leighand", "kaylie", "maryelle", "zaylee", "aya", "karli", "madelynn", "port", "kaylin", "marak", "kailee", "annalyn", "elliana", "niko", "jorden"];
+const sb = document.getElementById("samples"); for (const s of SAMPLES) { const d = document.createElement("div"); d.textContent = s; sb.appendChild(d); }
+</script>

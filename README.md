@@ -47,6 +47,12 @@ a step is tens of microseconds, so parking threads on channels or condvars would
 the compute. Nothing allocates in steady state. Because which worker sums which document varies,
 multi-threaded results are deterministic only up to floating-point summation order.
 
+## Report
+
+[docs/report.html](docs/report.html) is a self-contained write-up of the port and every experiment
+below: what each optimisation bought, thread scaling, batch size at equal data, the learning-rate
+sweep, seed noise, and model size at matched time budgets, with charts.
+
 ## Loss curves and experiments
 
 Knobs, all environment variables so the positional arguments stay `[num_steps] [batch_size] [threads]`:
