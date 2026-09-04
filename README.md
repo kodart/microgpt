@@ -50,12 +50,14 @@ does not disturb the timings. The final held-out loss is always printed.
 
 [docs/loss-curves.html](docs/loss-curves.html) charts held-out loss against training wall-clock
 time for the gist's recipe (`20000 1 1`), the same recipe run for the batched runs' time budget
-(`156000 1 1`), and minibatches of 32 on 8 threads, 16 on 4 and 32 on 4 (`20000 32 8`,
-`20000 16 4`, `20000 32 4`); the logs are in [docs/loss-logs](docs/loss-logs). On this laptop the
-batched runs reach a held-out loss of 2.30 about 4-6x sooner than the single-name recipe
-and all end near 2.11 versus 2.22 for the single-name recipe given the same time.
-16 x 4 finishes in 89% of the 32 x 8 time and 32 x 4 in 151%, and 4 threads are far less
-sensitive to other processes using cores, which is why 16 x 4 is the default.
+(`291000 1 1`), and minibatches of 32 on 8 threads and of 16, 32 and 64 on 4 threads
+(`20000 32 8`, `20000 16 4`, `20000 32 4`, `20000 64 4`); the logs are in
+[docs/loss-logs](docs/loss-logs). On this laptop the batched runs reach a held-out loss of 2.30
+about 4-6x sooner than the single-name recipe and end between 2.11 (64 x 4, 3.7 s) and
+2.12 (16 x 4, 1.2 s), versus 2.23 for the single-name recipe given 3.6 s. Bigger
+batches keep buying a little loss for proportionally more time; 16 x 4 is the default because it
+has the best loss per second, and 4 threads are far less sensitive to other processes using
+cores than 8.
 
 ## What was optimised
 
