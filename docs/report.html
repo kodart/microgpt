@@ -96,12 +96,12 @@
   <header>
     <div class="eyebrow">microgpt · Rust port · Apple M1 Pro · September 2026</div>
     <h1>The gist's GPT, 8,000x faster, and what that speed let us learn</h1>
-    <p class="lede">Karpathy's <code>microgpt.py</code> trains a 4,192-parameter character-level GPT on 32,033 names with a scalar autograd engine. This port keeps the maths and drops the engine. The wall-clock savings were then spent on the sweeps below: batch size, threads, learning rate, seeds and model size, each judged on the same 1,000 held-out names.</p>
+    <p class="lede">Karpathy's <code>microgpt.py</code> trains a 4,192-parameter character-level GPT on 32,033 names with a scalar autograd engine. This port keeps the maths and drops the engine. The wall-clock savings were then spent on the sweeps below: batch size, threads, learning rate, seeds and model size, each judged on the same 1,000 held-out names, and finally on a mixture-of-experts MLP whose experts turn out to be readable.</p>
     <div class="tiles">
       <div class="tile"><div class="label">Gist recipe, Python (1000 steps)</div><div class="value">109 s</div><div class="sub">CPython 3, scalar autograd</div></div>
       <div class="tile"><div class="label">Gist recipe, this port</div><div class="value">14 ms</div><div class="sub">same model, same steps, one thread</div></div>
       <div class="tile"><div class="label">Default run, held-out loss</div><div class="value">2.123</div><div class="sub">20000 steps x 16 names, 4 threads, 0.86 s</div></div>
-      <div class="tile"><div class="label">Best run, held-out loss</div><div class="value">2.026</div><div class="sub">2 layers, 32-dim, 10500 x 64, 7.5 s</div></div>
+      <div class="tile"><div class="label">Best run, held-out loss</div><div class="value">2.024</div><div class="sub">2 layers, 32-dim, 8 experts, 20000 x 64, 17.8 s</div></div>
     </div>
   </header>
 
@@ -236,8 +236,9 @@
     <div class="eyebrow">07 · Recommendations</div>
     <h2>What to run</h2>
     <div class="callout">
+      <p><strong>Want to see experts specialise:</strong> <code>MICROGPT_N_EXPERTS=8 MICROGPT_TOP_K=2 MICROGPT_HIDDEN=64 cargo build --release</code>, then run with <code>MICROGPT_EXPERT_STATS=1</code> to print the routing tables in section 06.</p>
       <p><strong>Want under a second of training:</strong> the 32-dim single layer at 6700 x 16 on 4 threads reaches 2.107 in 0.8 s, better than the gist's shape gets in any amount of time at this recipe.</p>
-      <p><strong>Want the lowest loss:</strong> the 2-layer 32-dim model at 64 names per step, 4 threads. 2.026 in 7.5 s, and still improving with more steps. <strong>Want the best loss per second:</strong> a 16-dim layer with 8 experts of 64, top-2, at 64 x 4: 2.049 in 5.6 s.</p>
+      <p><strong>Want the lowest loss:</strong> the 2-layer 32-dim model at 64 names per step, 4 threads: 2.026 in 7.5 s. Adding 8 experts of 64 to it reaches 2.024 in 17.8 s, so the extra capacity is not worth its time at this data size. <strong>Want the best loss per second:</strong> a 16-dim layer with 8 experts of 64, top-2, at 64 x 4: 2.049 in 5.6 s.</p>
       <p><strong>Leave the learning rate at 0.01</strong> for any batched run; lower it to 0.005 only for the one-name recipe. Use 6 threads instead of 4 when nothing else is running.</p>
     </div>
     <h3>Not worth pursuing</h3>
@@ -257,7 +258,7 @@
       <li><strong>Timing</strong> is training wall-clock only, and every number on this page was re-measured with the final code (commit history in the repo records the intermediate builds). Loss logging snapshots the parameters (16 KB) during training and evaluates them afterwards; an earlier inline evaluator slowed the 8-thread run by 75% by disturbing the worker scheduling and was replaced.</li>
       <li><strong>Correctness</strong> rests on an f64 finite-difference gradient check over a few hundred parameters (max relative error under 1e-4, run for all four model shapes and for the mixture-of-experts build), an incremental-versus-full forward equivalence test for the KV cache, and a check that 1-thread and 3-thread training produce the same parameters to 1e-9.</li>
       <li><strong>Machine:</strong> Apple M1 Pro, 8 performance + 2 efficiency cores, Rust 1.97 stable. The Python baseline is CPython 3 on the same laptop. The RNG is xoshiro256** and does not reproduce Python's stream, so exact losses differ from the gist.</li>
-      <li><strong>Code:</strong> <code>src/main.rs</code> (about 1,200 lines including tests), <code>build.rs</code> for the model shape, <code>docs/loss-curves.html</code> and <code>docs/loss-logs/</code> for the recorded runs.</li>
+      <li><strong>Code:</strong> <code>src/main.rs</code> (about 1,600 lines including tests), <code>build.rs</code> for the model shape and expert configuration, <code>docs/loss-curves.html</code> and <code>docs/loss-logs/</code> for the recorded runs.</li>
     </ul>
   </section>
 </main>
