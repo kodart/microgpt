@@ -164,7 +164,7 @@
   <section>
     <div class="eyebrow">04 · Time versus loss</div>
     <h2>The batched runs on the clock</h2>
-    <p>The interactive comparison of held-out loss against training wall-clock time lives in its own page: <a href="https://claude.ai/code/artifact/55f555eb-9667-429a-b9bb-dce816fa94c5">microgpt Training Race</a>. It covers the gist's recipe, the same recipe given the batched runs' time budget, and 32 x 8, 16 x 4, 32 x 4 and 64 x 4 minibatches, with axes switchable between time, steps and names seen.</p>
+    <p>The interactive comparison of held-out loss against training wall-clock time lives in its own page: <a href="https://kodart.github.io/microgpt/loss-curves.html">microgpt Training Race</a>. It covers the gist's recipe, the same recipe given the batched runs' time budget, and 32 x 8, 16 x 4, 32 x 4 and 64 x 4 minibatches, with axes switchable between time, steps and names seen.</p>
     <div class="table-wrap"><table>
       <thead><tr><th>Run</th><th class="num">Training time</th><th class="num">Held-out loss</th><th class="num">Time to reach 2.30</th></tr></thead>
       <tbody>
@@ -260,7 +260,7 @@
       <li><strong>Correctness</strong> rests on an f64 finite-difference gradient check over a few hundred parameters (max relative error under 1e-4, run for all four model shapes and for the mixture-of-experts build), an incremental-versus-full forward equivalence test for the KV cache, and a check that 1-thread and 3-thread training produce the same parameters to 1e-9.</li>
       <li><strong>Knobs:</strong> positional arguments <code>[steps] [batch] [threads]</code>; environment variables <code>MICROGPT_LR</code>, <code>MICROGPT_SCHEDULE</code> (linear, cosine, constant), <code>MICROGPT_SEED</code>, <code>MICROGPT_LOG</code> / <code>MICROGPT_EVAL_EVERY</code>, <code>MICROGPT_EXPERT_STATS</code>; model shape and experts at build time via <code>MICROGPT_N_LAYER</code>, <code>MICROGPT_N_EMBD</code>, <code>MICROGPT_N_HEAD</code>, <code>MICROGPT_BLOCK_SIZE</code>, <code>MICROGPT_N_EXPERTS</code>, <code>MICROGPT_TOP_K</code>, <code>MICROGPT_HIDDEN</code>. The data shuffle and held-out split always use seed 42; <code>MICROGPT_SEED</code> reseeds only the parameter initialisation, so seed 42 given explicitly is a different initialisation from the unset default (the gist's single stream). Tables that set seeds explicitly are like for like within themselves but a few thousandths off the default-seed tables.</li>
       <li><strong>Machine:</strong> Apple M1 Pro, 8 performance + 2 efficiency cores, Rust 1.97 stable. The Python baseline is CPython 3 on the same laptop. The RNG is xoshiro256** and does not reproduce Python's stream, so exact losses differ from the gist.</li>
-      <li><strong>Code:</strong> <code>src/main.rs</code> (about 1,600 lines including tests), <code>build.rs</code> for the model shape and expert configuration, <code>docs/loss-curves.html</code> and <code>docs/loss-logs/</code> for the recorded runs.</li>
+      <li><strong>Code:</strong> <code>src/main.rs</code> (about 1,600 lines including tests), <code>build.rs</code> for the model shape and expert configuration, <code>docs/loss-curves.html</code> and <code>docs/loss-logs/</code> for the recorded runs. Source and pages: <a href="https://github.com/kodart/microgpt">github.com/kodart/microgpt</a>.</li>
     </ul>
   </section>
 </main>

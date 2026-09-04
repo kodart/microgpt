@@ -54,6 +54,8 @@ order.
 
 ## Report
 
+Published at [kodart.github.io/microgpt](https://kodart.github.io/microgpt/) (the interactive
+loss curves are at [kodart.github.io/microgpt/loss-curves.html](https://kodart.github.io/microgpt/loss-curves.html)).
 [docs/report.html](docs/report.html) is a self-contained write-up of the port and every experiment
 below: what each optimisation bought, thread scaling, batch size at equal data, the learning-rate
 sweep, seed noise, and model size at matched time budgets, with charts.
