@@ -95,13 +95,13 @@
 <main>
   <header>
     <div class="eyebrow">microgpt · Rust port · Apple M1 Pro · September 2026</div>
-    <h1>The gist's GPT, 9,000x faster, and what that speed let us learn</h1>
+    <h1>The gist's GPT, 8,000x faster, and what that speed let us learn</h1>
     <p class="lede">Karpathy's <code>microgpt.py</code> trains a 4,192-parameter character-level GPT on 32,033 names with a scalar autograd engine. This port keeps the maths and drops the engine. The wall-clock savings were then spent on the sweeps below: batch size, threads, learning rate, seeds and model size, each judged on the same 1,000 held-out names.</p>
     <div class="tiles">
       <div class="tile"><div class="label">Gist recipe, Python (1000 steps)</div><div class="value">109 s</div><div class="sub">CPython 3, scalar autograd</div></div>
-      <div class="tile"><div class="label">Gist recipe, this port</div><div class="value">12 ms</div><div class="sub">same model, same steps, one thread</div></div>
-      <div class="tile"><div class="label">Default run, held-out loss</div><div class="value">2.120</div><div class="sub">20000 steps x 16 names, 4 threads, 0.88 s</div></div>
-      <div class="tile"><div class="label">Best run, held-out loss</div><div class="value">2.031</div><div class="sub">2 layers, 32-dim, 10500 x 64, 11 s</div></div>
+      <div class="tile"><div class="label">Gist recipe, this port</div><div class="value">14 ms</div><div class="sub">same model, same steps, one thread</div></div>
+      <div class="tile"><div class="label">Default run, held-out loss</div><div class="value">2.123</div><div class="sub">20000 steps x 16 names, 4 threads, 0.86 s</div></div>
+      <div class="tile"><div class="label">Best run, held-out loss</div><div class="value">2.026</div><div class="sub">2 layers, 32-dim, 10500 x 64, 7.5 s</div></div>
     </div>
   </header>
 
@@ -122,7 +122,7 @@
         <tr><td><strong>Build flags</strong></td><td>Fat LTO, one codegen unit, <code>panic=abort</code>, <code>target-cpu=native</code>.</td><td class="num">baseline</td></tr>
       </tbody>
     </table></div>
-    <p class="note">Per-name costs are single-thread, 32 names per step; the port now trains the gist's model at about 7.3 µs per name, against roughly 100 ms per name in Python. The KV cache for sampling comes for free: the stored K/V rows of the activation buffer are the cache, and generation runs one new position against them. The 4-thread speed-up fell from 3.2x to 2.6x as the kernels got faster, because the per-step synchronisation cost did not shrink with them.</p>
+    <p class="note">Per-name costs are single-thread, 32 names per step; the port now trains the gist's model at about 7.5 µs per name, against roughly 100 ms per name in Python. The KV cache for sampling comes for free: the stored K/V rows of the activation buffer are the cache, and generation runs one new position against them. The 4-thread speed-up fell from 3.2x to 2.6x as the kernels got faster, because the per-step synchronisation cost did not shrink with them.</p>
   </section>
 
   <section>
@@ -132,10 +132,10 @@
       <h3>Time per optimizer step, 32 names per step</h3>
       <div class="legend" id="lg-threads"></div>
       <div class="plot-wrap"><svg class="plot" id="ch-threads" viewBox="0 0 1000 380" role="img"><title>Step time against thread count</title></svg><div class="tooltip" hidden></div></div>
-      <p class="note">Quiet-machine measurements, 20000 steps, taken before the two matmul changes above (the kernels are now 1.45x faster at one thread, so absolute values are lower; the shape of the curve, and the fixed synchronisation cost that bends it, are unchanged). Ten-thread runs are omitted: on this 8-performance + 2-efficiency-core CPU they were 1.6 to 3x slower than eight and never repeatable.</p>
+      <p class="note">Quiet-machine measurements with the final code, 20000 steps. Ten-thread runs are omitted: on this 8-performance + 2-efficiency-core CPU they were 1.6 to 3x slower than eight and never repeatable.</p>
       <details><summary>Table view</summary><div class="table-wrap"><table id="tb-threads"></table></div></details>
     </div>
-    <p style="margin-top:14px">A 32-name step is now about 30 µs of arithmetic on eight cores; the barrier plus reduce-and-Adam is another 25 to 30 µs and does not shrink with threads. That fixed cost is why the curve bends. It is also why eight threads are a bad default: with all performance cores busy, any other process (a browser, or macOS's Gatekeeper scanning freshly built binaries, which happened repeatedly during this work) turned 1.5 s runs into 3 to 8 s, while 4-thread runs stayed at 1.1 s throughout. Six threads are about 20% faster than four on a quiet machine and are worth passing explicitly.</p>
+    <p style="margin-top:14px">A 32-name step is about 30 µs of arithmetic on eight cores; the two barriers, the parallel update and the load imbalance between names of different lengths add another 25 µs that does not shrink with threads. That fixed cost is why the curve bends. It is also why eight threads are a bad default: with all performance cores busy, any other process (a browser, or macOS's Gatekeeper scanning freshly built binaries, which happened repeatedly during this work) turned 1.5 s runs into 3 to 8 s, while 4-thread runs stayed at 1.1 s throughout. Six threads are about 20% faster than four on a quiet machine and are worth passing explicitly.</p>
   </section>
 
   <section>
@@ -157,7 +157,7 @@
       </div>
     </div>
     <p style="margin-top:14px">Two results that went against the usual intuition. At equal data, <em>larger</em> batches win: the one-name-per-step recipe updates most often but its gradients are so noisy that the extra updates are worth less than the noise costs, and the trend only flattens at 64. And larger batches do not want a larger learning rate: 0.01 is already the optimum for 16- and 64-name batches, with every higher rate strictly worse. The batched runs are noise-limited, not step-limited. The one recipe that does want a change is the gist's own, which improves from 2.223 to 2.203 at a rate of 0.005.</p>
-    <p>Four seeds of the default run end at 2.120, 2.122, 2.123 and 2.130. Differences under about 0.01 in any table here are noise; the batch-size and model-size effects are several times that.</p>
+    <p>Four seeds of the default run end at 2.120, 2.122, 2.123 and 2.130, and re-running one configuration moves it by up to 0.007 through thread summation order alone. Differences under about 0.01 in any table here are noise; the batch-size and model-size effects are several times that.</p>
   </section>
 
   <section>
@@ -167,15 +167,15 @@
     <div class="table-wrap"><table>
       <thead><tr><th>Run</th><th class="num">Training time</th><th class="num">Held-out loss</th><th class="num">Time to reach 2.30</th></tr></thead>
       <tbody>
-        <tr><td>Gist recipe, 20000 x 1, 1 thread</td><td class="num">0.22 s</td><td class="num">2.222</td><td class="num">0.109 s</td></tr>
-        <tr><td>Same recipe, 276000 steps (equal time)</td><td class="num">3.14 s</td><td class="num">2.222</td><td class="num"></td></tr>
-        <tr><td>32 names x 8 threads</td><td class="num">1.30 s</td><td class="num">2.112</td><td class="num">0.023 s</td></tr>
-        <tr><td>16 names x 4 threads (default)</td><td class="num">0.95 s</td><td class="num">2.120</td><td class="num">0.025 s</td></tr>
-        <tr><td>32 names x 4 threads</td><td class="num">1.79 s</td><td class="num">2.116</td><td class="num">0.037 s</td></tr>
-        <tr><td>64 names x 4 threads</td><td class="num">3.11 s</td><td class="num">2.103</td><td class="num">0.030 s</td></tr>
+        <tr><td>Gist recipe, 20000 x 1, 1 thread</td><td class="num">0.26 s</td><td class="num">2.222</td><td class="num">0.126 s</td></tr>
+        <tr><td>Same recipe, 207000 steps (equal time)</td><td class="num">2.74 s</td><td class="num">2.202</td><td class="num"></td></tr>
+        <tr><td>32 names x 8 threads</td><td class="num">1.15 s</td><td class="num">2.113</td><td class="num">0.018 s</td></tr>
+        <tr><td>16 names x 4 threads (default)</td><td class="num">0.87 s</td><td class="num">2.127</td><td class="num">0.023 s</td></tr>
+        <tr><td>32 names x 4 threads</td><td class="num">1.50 s</td><td class="num">2.115</td><td class="num">0.024 s</td></tr>
+        <tr><td>64 names x 4 threads</td><td class="num">2.73 s</td><td class="num">2.105</td><td class="num">0.028 s</td></tr>
       </tbody>
     </table></div>
-    <p class="note">Re-recorded with the final kernels. The single-name recipe given nine passes over the data ends no better than after one: with this learning rate schedule it stops improving after a few epochs, while the batched runs keep improving.</p>
+    <p class="note">Recorded with the final code. The single-name recipe given seven passes over the data gains only 0.02 over one pass: with this learning-rate schedule it stops improving after a few epochs, while the batched runs keep improving.</p>
   </section>
 
   <section>
@@ -185,13 +185,13 @@
       <h3>Held-out loss by time budget, four model shapes</h3>
       <div class="legend" id="lg-model"></div>
       <div class="plot-wrap"><svg class="plot" id="ch-model" viewBox="0 0 1000 380" role="img"><title>Held-out loss against time budget for four model shapes</title></svg><div class="tooltip" hidden></div></div>
-      <p class="note">4 threads, measured before the two matmul changes (every shape is now roughly 1.3x faster at 4 threads, so each budget buys proportionally more steps). Steps and batch were chosen per model to land on each budget; the exact recipes are in the table. Log-scaled x axis.</p>
+      <p class="note">4 threads, final code. Each model runs the same three recipes it was given when the budgets were first set at 1.1, 3.6 and 11 seconds; with the faster kernels they now land near 0.8, 2.6 and 8 seconds. The exact recipes are in the table. Log-scaled x axis.</p>
       <details><summary>Table view</summary><div class="table-wrap"><table id="tb-model"></table></div></details>
     </div>
-    <p style="margin-top:14px">Every larger shape beats the gist's model at every budget, including the one-second budget where the bigger models get a fraction of the steps. The 32-dimensional single layer is the best buy up to a few seconds and then saturates near 2.055; the 2-layer 32-dimensional model keeps improving and wins once ten seconds are affordable. Model shape is a build-time choice because the activation buffers are fixed-size arrays:</p>
+    <p style="margin-top:14px">Every larger shape beats the gist's model at every budget, including the sub-second budget where the bigger models get a fraction of the steps. The 32-dimensional single layer is the best buy up to a few seconds and then saturates near 2.055; the 2-layer 32-dimensional model keeps improving and wins once eight seconds are affordable. Model shape is a build-time choice because the activation buffers are fixed-size arrays:</p>
     <pre>MICROGPT_N_EMBD=32 MICROGPT_N_LAYER=2 cargo build --release</pre>
     <h3>Twenty names from the best model</h3>
-    <p class="note" style="margin-bottom:8px">2 layers, 32-dim, 10500 steps x 64 names, temperature 0.5. None of these are in the dataset's training split.</p>
+    <p class="note" style="margin-bottom:8px">2 layers, 32-dim, 10500 steps x 64 names, temperature 0.5, 7.5 s of training (this run scored 2.033; the grid run above 2.026, the difference being thread summation order). None of these are in the dataset's training split.</p>
     <div class="samples" id="samples"></div>
   </section>
 
@@ -199,8 +199,8 @@
     <div class="eyebrow">06 · Recommendations</div>
     <h2>What to run</h2>
     <div class="callout">
-      <p><strong>Want a second of training:</strong> the 32-dim single layer at 6700 x 16 on 4 threads reaches 2.104 in 1.1 s, better than the gist's shape gets in any amount of time at this recipe.</p>
-      <p><strong>Want the lowest loss:</strong> the 2-layer 32-dim model at 64 names per step, 4 threads. 2.035 in 11 s, and still improving with more steps.</p>
+      <p><strong>Want under a second of training:</strong> the 32-dim single layer at 6700 x 16 on 4 threads reaches 2.107 in 0.8 s, better than the gist's shape gets in any amount of time at this recipe.</p>
+      <p><strong>Want the lowest loss:</strong> the 2-layer 32-dim model at 64 names per step, 4 threads. 2.026 in 7.5 s, and still improving with more steps.</p>
       <p><strong>Leave the learning rate at 0.01</strong> for any batched run; lower it to 0.005 only for the one-name recipe. Use 6 threads instead of 4 when nothing else is running.</p>
     </div>
     <h3>Not worth pursuing</h3>
@@ -217,7 +217,7 @@
     <h2>How the numbers were taken</h2>
     <ul>
       <li><strong>Held-out loss</strong> is the mean cross-entropy over the last 1,000 names of the seed-42 shuffle, which are never trained on. Every configuration is scored on the same names. Training-batch losses are not compared across batch sizes.</li>
-      <li><strong>Timing</strong> is training wall-clock only. Loss logging snapshots the parameters (16 KB) during training and evaluates them afterwards; an earlier inline evaluator slowed the 8-thread run by 75% by disturbing the worker scheduling and was replaced.</li>
+      <li><strong>Timing</strong> is training wall-clock only, and every number on this page was re-measured with the final code (commit history in the repo records the intermediate builds). Loss logging snapshots the parameters (16 KB) during training and evaluates them afterwards; an earlier inline evaluator slowed the 8-thread run by 75% by disturbing the worker scheduling and was replaced.</li>
       <li><strong>Correctness</strong> rests on an f64 finite-difference gradient check over a few hundred parameters (max relative error under 1e-4, run for all four model shapes), an incremental-versus-full forward equivalence test for the KV cache, and a check that 1-thread and 3-thread training produce the same parameters to 1e-9.</li>
       <li><strong>Machine:</strong> Apple M1 Pro, 8 performance + 2 efficiency cores, Rust 1.97 stable. The Python baseline is CPython 3 on the same laptop. The RNG is xoshiro256** and does not reproduce Python's stream, so exact losses differ from the gist.</li>
       <li><strong>Code:</strong> <code>src/main.rs</code> (about 1,200 lines including tests), <code>build.rs</code> for the model shape, <code>docs/loss-curves.html</code> and <code>docs/loss-logs/</code> for the recorded runs.</li>
@@ -311,14 +311,14 @@ function barChart(svgId, bars, opts) {
 }
 
 // ---- data
-const THREADS = [[1, 340], [3, 126], [4, 97], [5, 85], [6, 76], [8, 66]];
-const ideal = THREADS.map(([t]) => [t, 340 / t]);
+const THREADS = [[1, 239], [3, 94], [4, 74], [5, 65], [6, 58], [8, 56]];
+const ideal = THREADS.map(([t]) => [t, 239 / t]);
 lineChart("ch-threads", [
   { name: "Measured, 32 names per step", cls: "s1", pts: THREADS, labelEnd: p => p[1] + " µs at " + p[0] + " threads" },
-  { name: "Perfect scaling (340 µs / threads)", cls: "gray", pts: ideal, dash: true, noDots: true, labelEnd: p => Math.round(p[1]) + " µs ideal" },
-], { right: 150, x: { label: "Threads", fmt: v => v, ticks: [1, 2, 3, 4, 5, 6, 7, 8], tip: v => v + " thread" + (v > 1 ? "s" : "") }, y: { label: "µs per step", lo: 0, hi: 350, fmt: v => Math.round(v) } });
+  { name: "Perfect scaling (239 µs / threads)", cls: "gray", pts: ideal, dash: true, noDots: true, labelEnd: p => Math.round(p[1]) + " µs ideal" },
+], { right: 150, x: { label: "Threads", fmt: v => v, ticks: [1, 2, 3, 4, 5, 6, 7, 8], tip: v => v + " thread" + (v > 1 ? "s" : "") }, y: { label: "µs per step", lo: 0, hi: 250, fmt: v => Math.round(v) } });
 legend("lg-threads", [{ name: "Measured, 32 names per step", cls: "s1" }, { name: "Perfect scaling", cls: "gray dash" }]);
-table("tb-threads", ["Threads", "µs per step", "Speed-up", "Ideal speed-up"], THREADS.map(([t, us]) => [t, us, (340 / us).toFixed(2) + "x", t + "x"]));
+table("tb-threads", ["Threads", "µs per step", "Speed-up", "Ideal speed-up"], THREADS.map(([t, us]) => [t, us, (239 / us).toFixed(2) + "x", t + "x"]));
 
 const BATCH = [[8, 2.139, "80000 x 8"], [16, 2.130, "40000 x 16"], [32, 2.119, "20000 x 32"], [64, 2.108, "10000 x 64"], [128, 2.109, "5000 x 128"]];
 barChart("ch-batch", BATCH.map(([b, v, r]) => ({ label: String(b), value: v, tip: r + " names", direct: true, hl: b === 64 })), { x: { label: "Names per step" }, y: { label: "Held-out loss", short: "held-out loss", lo: 2.08, hi: 2.16, fmt: v => v.toFixed(3) } });
@@ -334,16 +334,16 @@ legend("lg-lr", [{ name: "16 names x 4 threads", cls: "s1" }, { name: "64 names 
 table("tb-lr", ["Learning rate", "16 x 4", "64 x 4"], LR16.map(([lr, v], i) => [lr, v.toFixed(3), LR64[i][1].toFixed(3)]));
 
 const MODELS = [
-  { name: "1 layer, 16-dim (gist)", cls: "s1", params: "4,192", pts: [[1.11, 2.122, "20000 x 16"], [3.63, 2.100, "20000 x 64"]] },
-  { name: "1 layer, 32-dim", cls: "s2", params: "14,528", pts: [[1.11, 2.104, "6700 x 16"], [3.63, 2.057, "6600 x 64"], [10.95, 2.055, "20000 x 64"]] },
-  { name: "2 layers, 16-dim", cls: "s3", params: "7,264", pts: [[1.11, 2.107, "11500 x 16"], [3.43, 2.090, "20000 x 32"], [12.83, 2.056, "20000 x 128"]] },
-  { name: "2 layers, 32-dim", cls: "s4", params: "26,816", pts: [[1.09, 2.108, "3500 x 16"], [3.51, 2.071, "11500 x 16"], [10.94, 2.035, "10500 x 64"]] },
+  { name: "1 layer, 16-dim (gist)", cls: "s1", params: "4,192", pts: [[0.86, 2.123, "20000 x 16"], [2.72, 2.103, "20000 x 64"]] },
+  { name: "1 layer, 32-dim", cls: "s2", params: "14,528", pts: [[0.80, 2.107, "6700 x 16"], [2.68, 2.060, "6600 x 64"], [7.85, 2.053, "20000 x 64"]] },
+  { name: "2 layers, 16-dim", cls: "s3", params: "7,264", pts: [[0.85, 2.105, "11500 x 16"], [2.55, 2.091, "20000 x 32"], [9.22, 2.064, "20000 x 128"]] },
+  { name: "2 layers, 32-dim", cls: "s4", params: "26,816", pts: [[0.74, 2.108, "3500 x 16"], [2.43, 2.083, "11500 x 16"], [7.46, 2.026, "10500 x 64"]] },
 ];
 lineChart("ch-model", MODELS.map(m => ({ name: m.name, cls: m.cls, pts: m.pts.map(p => [p[0], p[1]]), labelEnd: p => p[1].toFixed(3) + "  " + m.name.replace(" (gist)", "") })),
-  { right: 190, x: { label: "Training time budget (s)", log: true, lo: 1, hi: 13, fmt: v => v, ticks: [1, 2, 3, 5, 10], tip: v => "≈ " + v + " s" }, y: { label: "Held-out loss", lo: 2.02, hi: 2.14, fmt: v => v.toFixed(2) } });
+  { right: 190, x: { label: "Training time (s)", log: true, lo: 0.7, hi: 10, fmt: v => v, ticks: [0.7, 1, 2, 3, 5, 10], tip: v => v + " s" }, y: { label: "Held-out loss", lo: 2.02, hi: 2.14, fmt: v => v.toFixed(2) } });
 legend("lg-model", MODELS.map(m => ({ name: m.name, cls: m.cls })));
-table("tb-model", ["Model", "Params", "~1.1 s", "~3.6 s", "~11 s"], MODELS.map(m => [m.name, m.params, ...[0, 1, 2].map(i => m.pts[i] ? m.pts[i][1].toFixed(3) + " (" + m.pts[i][2] + ")" : "")]));
+table("tb-model", ["Model", "Params", "~0.8 s", "~2.6 s", "~8 s"], MODELS.map(m => [m.name, m.params, ...[0, 1, 2].map(i => m.pts[i] ? m.pts[i][1].toFixed(3) + " (" + m.pts[i][2] + ")" : "")]));
 
-const SAMPLES = ["rhyan", "jaire", "kensly", "kameer", "jessin", "leighand", "kaylie", "maryelle", "zaylee", "aya", "karli", "madelynn", "port", "kaylin", "marak", "kailee", "annalyn", "elliana", "niko", "jorden"];
+const SAMPLES = ["rhyanna", "ariston", "corianna", "amiya", "shang", "aleana", "zaydin", "joselin", "ayden", "ayato", "kamriah", "alana", "mahlil", "nikola", "ameria", "jayden", "ari", "elliana", "niella", "carlee"];
 const sb = document.getElementById("samples"); for (const s of SAMPLES) { const d = document.createElement("div"); d.textContent = s; sb.appendChild(d); }
 </script>
