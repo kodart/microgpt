@@ -24,7 +24,8 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::ops::Range;
+use std::sync::Mutex;
 use std::time::Instant;
 
 /// Training/inference runs in f32; the gradient-check test runs the same code in f64.
@@ -368,6 +369,32 @@ impl Model {
     /// The weight matrices used by linear layers, i.e. everything except the embedding tables.
     fn linear_tensors(&self) -> impl Iterator<Item = Tensor> + '_ {
         std::iter::once(self.lm_head).chain(self.layers.iter().flat_map(|l| [l.wqkv, l.wo, l.fc1, l.fc2]))
+    }
+
+    /// Like [`Model::transpose_into`] but only for parameter indices in `r`, writing through
+    /// `put(index_in_pt, value)`. Reads are sequential and writes strided, which the store
+    /// pipeline handles far better than an index table.
+    fn transpose_range(&self, p: &[Float], r: Range<usize>, mut put: impl FnMut(usize, Float)) {
+        let emb = r.start..r.end.min(self.lm_head.off);
+        for i in emb {
+            put(i, p[i]);
+        }
+        for t in self.linear_tensors() {
+            let lo = r.start.max(t.off);
+            let hi = r.end.min(t.off + t.len());
+            if lo >= hi {
+                continue;
+            }
+            let (mut o, mut j) = ((lo - t.off) / t.cols, (lo - t.off) % t.cols);
+            for i in lo..hi {
+                put(t.off + j * t.rows + o, p[i]);
+                j += 1;
+                if j == t.cols {
+                    j = 0;
+                    o += 1;
+                }
+            }
+        }
     }
 
     /// Write the transposed layout of `p` into `pt`: every linear weight [out][in] becomes
@@ -715,11 +742,27 @@ impl Model {
 // Adam
 // ---------------------------------------------------------------------------------------------
 
+#[cfg(test)]
 struct Adam {
     m: Vec<Float>,
     v: Vec<Float>,
 }
 
+/// Bias-correction factors for Adam step `t` (1-based): (1 / (1 - beta1^t), 1 / (1 - beta2^t)).
+#[inline]
+fn adam_corrections(t: usize) -> (Float, Float) {
+    (1.0 / (1.0 - BETA1.powi(t as i32)), 1.0 / (1.0 - BETA2.powi(t as i32)))
+}
+
+/// One Adam update of a single parameter given its gradient and moment estimates.
+#[inline]
+fn adam_elem(p: &mut Float, g: Float, m: &mut Float, v: &mut Float, lr: Float, c1: Float, c2: Float) {
+    *m = BETA1.mul_add(*m, (1.0 - BETA1) * g);
+    *v = BETA2.mul_add(*v, (1.0 - BETA2) * g * g);
+    *p -= lr * (*m * c1) / ((*v * c2).sqrt() + EPS_ADAM);
+}
+
+#[cfg(test)]
 impl Adam {
     fn new(n: usize) -> Self {
         Adam { m: vec![0.0; n], v: vec![0.0; n] }
@@ -727,15 +770,9 @@ impl Adam {
 
     /// One Adam step with bias correction; zeroes the gradient buffer afterwards.
     fn step(&mut self, p: &mut [Float], g: &mut [Float], lr: Float, t: usize) {
-        let c1 = 1.0 / (1.0 - BETA1.powi(t as i32));
-        let c2 = 1.0 / (1.0 - BETA2.powi(t as i32));
+        let (c1, c2) = adam_corrections(t);
         for i in 0..p.len() {
-            let gi = g[i];
-            let m = BETA1.mul_add(self.m[i], (1.0 - BETA1) * gi);
-            let v = BETA2.mul_add(self.v[i], (1.0 - BETA2) * gi * gi);
-            self.m[i] = m;
-            self.v[i] = v;
-            p[i] -= lr * (m * c1) / ((v * c2).sqrt() + EPS_ADAM);
+            adam_elem(&mut p[i], g[i], &mut self.m[i], &mut self.v[i], lr, c1, c2);
             g[i] = 0.0;
         }
     }
@@ -804,17 +841,22 @@ impl Dataset {
 // ---------------------------------------------------------------------------------------------
 // Training: minibatches spread over a pool of persistent worker threads.
 //
-// Every step, workers claim documents of the batch one at a time from a shared atomic counter
-// (so fast cores naturally take more work than slow ones, and no worker is a straggler). Each
-// worker forwards/backwards its documents into its own gradient buffer (sum of the per-document,
-// per-token-averaged gradients). The main thread reduces the buffers, scales by 1/batch_size and
-// takes one Adam step. Which worker sums which document varies between runs, so multi-threaded
-// results are deterministic only up to floating-point summation order.
+// Every step has two phases, separated by spin barriers on atomic counters:
 //
-// A step is only tens of microseconds of compute, so parking/unparking threads through channels
-// or condvars would dominate. Workers instead spin (briefly, then yield) on an atomic epoch
-// counter that the main thread bumps to publish each step, and count themselves done on another
-// atomic. Nothing allocates in steady state.
+//  1. compute: workers claim documents of the batch from a shared atomic counter (so fast cores
+//     naturally take more work) and accumulate each document's gradient into their own buffer;
+//  2. update: each worker owns a contiguous slice of the parameters. It sums that slice across
+//     all workers' gradient buffers, applies Adam to it, writes the new values into both the
+//     row-major and the transposed parameter layouts, and zeroes the slice in every buffer.
+//
+// Phase 2 used to run on the main thread alone while the others spun; splitting it removes
+// most of the fixed per-step cost that limited thread scaling. A step of this model is only
+// tens of microseconds, so parking threads on channels or condvars would cost more than the
+// compute: workers spin briefly, then yield. Nothing allocates in steady state.
+//
+// The parameter, moment and gradient buffers are shared without locks (see `SharedBuf`); the
+// barriers are what make that sound. Which worker sums which document varies between runs, so
+// multi-threaded results are deterministic only up to floating-point summation order.
 // ---------------------------------------------------------------------------------------------
 
 struct TrainConfig {
@@ -831,20 +873,76 @@ struct TrainConfig {
     lr: Float,
 }
 
-/// Per-worker mailbox. Locks are only ever taken uncontended (main and worker alternate strictly).
-struct WorkerSlot {
-    grad: Mutex<Vec<Float>>, // accumulated gradient for the current step
-    loss: Mutex<Float>,      // sum of per-document mean losses for the current step
+/// A float buffer shared between worker threads without a lock.
+///
+/// Soundness rests on the two-phase protocol in `train`, enforced by the `computed` / `updated`
+/// barriers (Release/Acquire atomics): within the compute phase every shared buffer is either
+/// read-only for everyone (`params`, `params_t`) or written by exactly one thread (that
+/// worker's own gradient buffer); within the update phase every thread touches only the
+/// element indices of its own parameter slice (in `params`, `m`, `v`, all gradient buffers)
+/// or the transposed positions of that slice (in `params_t`), which are disjoint between
+/// workers. All accesses go through a raw pointer taken once at construction, so no `&mut`
+/// to the whole buffer is ever created while other threads use it.
+struct SharedBuf {
+    ptr: *mut Float,
+    len: usize,
+    _owner: Box<[Float]>,
+}
+
+// SAFETY: see the type-level comment; concurrent access is made race-free by `train`'s barriers.
+unsafe impl Sync for SharedBuf {}
+unsafe impl Send for SharedBuf {}
+
+impl SharedBuf {
+    fn new(v: Vec<Float>) -> Self {
+        let mut owner = v.into_boxed_slice();
+        let ptr = owner.as_mut_ptr();
+        SharedBuf { ptr, len: owner.len(), _owner: owner }
+    }
+
+    /// # Safety
+    /// No thread may write any element of `r` while the returned slice is alive.
+    unsafe fn get(&self, r: Range<usize>) -> &[Float] {
+        assert!(r.end <= self.len);
+        unsafe { std::slice::from_raw_parts(self.ptr.add(r.start), r.len()) }
+    }
+
+    /// # Safety
+    /// No other thread may read or write any element of `r` while the returned slice is alive.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn get_mut(&self, r: Range<usize>) -> &mut [Float] {
+        assert!(r.end <= self.len);
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.add(r.start), r.len()) }
+    }
+
+    /// # Safety
+    /// No other thread may read or write element `i` at the same time.
+    unsafe fn write(&self, i: usize, v: Float) {
+        assert!(i < self.len);
+        unsafe { *self.ptr.add(i) = v }
+    }
+
+    fn into_vec(self) -> Vec<Float> {
+        self._owner.into_vec()
+    }
 }
 
 struct Shared {
     epoch: AtomicUsize,    // step counter published by main; QUIT tells workers to exit
     next_doc: AtomicUsize, // next document (0..batch_size) of the current step to be claimed
-    done: AtomicUsize,     // workers that have finished the current epoch
+    computed: AtomicUsize, // workers (main included) that have finished the compute phase
+    updated: AtomicUsize,  // workers (main included) that have finished the update phase
     batch_size: usize,
-    params: RwLock<Vec<Float>>,
-    params_t: RwLock<Vec<Float>>, // transposed layout for the forward pass, refreshed after Adam
-    slots: Vec<WorkerSlot>,
+    n_threads: usize,
+    num_steps: usize,
+    lr: Float,
+    params: SharedBuf,   // row-major parameters
+    params_t: SharedBuf, // transposed layout, read by the forward pass
+    m: SharedBuf,        // Adam first moment
+    v: SharedBuf,        // Adam second moment
+    grads: Vec<SharedBuf>,     // one gradient buffer per worker
+    losses: Vec<Mutex<Float>>, // per worker: sum of per-document mean losses in the current step
+    slices: Vec<Range<usize>>, // parameter slice each worker owns in the update phase
 }
 
 const QUIT: usize = usize::MAX;
@@ -883,7 +981,7 @@ struct Worker<'a> {
     model: &'a Model,
     data: &'a Dataset,
     shared: &'a Shared,
-    slot: &'a WorkerSlot,
+    w: usize,
     acts: Box<Acts>,
     scratch: Box<Grads>,
     tokens: Vec<usize>,
@@ -895,20 +993,29 @@ impl<'a> Worker<'a> {
             model,
             data,
             shared,
-            slot: &shared.slots[w],
+            w,
             acts: Acts::new(model.vocab_size),
             scratch: Grads::new(model.vocab_size),
             tokens: Vec::with_capacity(BLOCK_SIZE + 2),
         }
     }
 
-    /// Claim and process documents of step `epoch - 1` until the batch is exhausted.
+    /// Compute phase of step `epoch - 1`: claim and process documents until the batch is
+    /// exhausted, accumulating into this worker's gradient buffer.
+    ///
+    /// `inline(never)` is deliberate and measurable: this is the hot loop, and if LLVM inlines it
+    /// into `train` (next to the thread-spawning and barrier code) the resulting giant function
+    /// is optimised noticeably worse.
+    #[inline(never)]
     fn run_step(&mut self, epoch: usize) {
         let shared = self.shared;
+        let n_params = self.model.n_params;
         let base = (epoch - 1) * shared.batch_size;
-        let p = shared.params.read().unwrap();
-        let pt = shared.params_t.read().unwrap();
-        let mut grad = self.slot.grad.lock().unwrap();
+        // SAFETY (compute phase): params / params_t are only read by anyone; grads[w] is only
+        // written by this worker.
+        let p = unsafe { shared.params.get(0..n_params) };
+        let pt = unsafe { shared.params_t.get(0..n_params) };
+        let grad = unsafe { shared.grads[self.w].get_mut(0..n_params) };
         let mut loss_sum = 0.0;
         loop {
             let k = shared.next_doc.fetch_add(1, Ordering::AcqRel);
@@ -918,11 +1025,46 @@ impl<'a> Worker<'a> {
             let doc = &self.data.docs[(base + k) % self.data.n_train];
             self.data.tokenize(doc, &mut self.tokens);
             let n = (self.tokens.len() - 1).min(BLOCK_SIZE);
-            self.model.forward(&p, &pt, &self.tokens, 0, n, &mut self.acts);
+            self.model.forward(p, pt, &self.tokens, 0, n, &mut self.acts);
             loss_sum += self.model.loss(&self.tokens, n, &mut self.acts);
-            self.model.backward(&p, &mut grad, &self.tokens, n, &self.acts, &mut self.scratch);
+            self.model.backward(p, grad, &self.tokens, n, &self.acts, &mut self.scratch);
         }
-        *self.slot.loss.lock().unwrap() = loss_sum;
+        *shared.losses[self.w].lock().unwrap() = loss_sum;
+    }
+
+    /// Update phase of step `epoch - 1`: reduce this worker's parameter slice over all gradient
+    /// buffers, apply Adam, write both parameter layouts, and zero the slice in every buffer.
+    #[inline(never)]
+    fn update(&self, epoch: usize) {
+        let shared = self.shared;
+        let step = epoch - 1;
+        let lr_t = shared.lr * (1.0 - step as Float / shared.num_steps as Float); // linear decay
+        let (c1, c2) = adam_corrections(step + 1);
+        let inv_b = 1.0 / shared.batch_size as Float;
+        let r = shared.slices[self.w].clone();
+        // SAFETY (update phase): every index below belongs to this worker's slice `r`, or is the
+        // transposed position of one, and slices are disjoint between workers.
+        let p = unsafe { shared.params.get_mut(r.clone()) };
+        let m = unsafe { shared.m.get_mut(r.clone()) };
+        let v = unsafe { shared.v.get_mut(r.clone()) };
+        // 1) reduce the other workers' gradients into buffer 0's slice, zeroing them as we go
+        let g = unsafe { shared.grads[0].get_mut(r.clone()) };
+        for b in &shared.grads[1..] {
+            let gb = unsafe { b.get_mut(r.clone()) };
+            for j in 0..g.len() {
+                g[j] += gb[j];
+                gb[j] = 0.0;
+            }
+        }
+        // 2) Adam over the slice (a flat loop, so LLVM unrolls it and pipelines the vector
+        //    sqrt/div instead of running them latency-bound), zeroing buffer 0 afterwards
+        for j in 0..g.len() {
+            adam_elem(&mut p[j], g[j] * inv_b, &mut m[j], &mut v[j], lr_t, c1, c2);
+            g[j] = 0.0;
+        }
+        // 3) mirror the new values into the transposed layout
+        let p_all = unsafe { shared.params.get(0..shared.params.len) };
+        self.model.transpose_range(p_all, r, |i, val| unsafe { shared.params_t.write(i, val) });
     }
 }
 
@@ -933,18 +1075,26 @@ fn train(model: &Model, data: &Dataset, params: &mut Vec<Float>, cfg: &TrainConf
     let num_steps = cfg.num_steps;
     let n_params = model.n_params;
 
+    let mut params_t = vec![0.0 as Float; n_params];
+    model.transpose_into(params, &mut params_t);
+    let per = n_params.div_ceil(n_threads);
     let shared = Shared {
         epoch: AtomicUsize::new(0),
         next_doc: AtomicUsize::new(0),
-        done: AtomicUsize::new(0),
+        computed: AtomicUsize::new(0),
+        updated: AtomicUsize::new(0),
         batch_size,
-        params: RwLock::new(std::mem::take(params)),
-        params_t: RwLock::new(vec![0.0 as Float; n_params]),
-        slots: (0..n_threads).map(|_| WorkerSlot { grad: Mutex::new(vec![0.0 as Float; n_params]), loss: Mutex::new(0.0) }).collect(),
+        n_threads,
+        num_steps,
+        lr: cfg.lr,
+        params: SharedBuf::new(std::mem::take(params)),
+        params_t: SharedBuf::new(params_t),
+        m: SharedBuf::new(vec![0.0 as Float; n_params]),
+        v: SharedBuf::new(vec![0.0 as Float; n_params]),
+        grads: (0..n_threads).map(|_| SharedBuf::new(vec![0.0 as Float; n_params])).collect(),
+        losses: (0..n_threads).map(|_| Mutex::new(0.0)).collect(),
+        slices: (0..n_threads).map(|w| (w * per).min(n_params)..((w + 1) * per).min(n_params)).collect(),
     };
-    model.transpose_into(&shared.params.read().unwrap(), &mut shared.params_t.write().unwrap());
-    let mut grads = vec![0.0 as Float; n_params];
-    let mut adam = Adam::new(n_params);
     let mut loss = 0.0;
 
     // (step, training seconds so far, mean train loss over the interval, parameter snapshot)
@@ -969,7 +1119,10 @@ fn train(model: &Model, data: &Dataset, params: &mut Vec<Float>, cfg: &TrainConf
                     }
                     seen = epoch;
                     worker.run_step(epoch);
-                    shared.done.fetch_add(1, Ordering::AcqRel);
+                    shared.computed.fetch_add(1, Ordering::AcqRel);
+                    wait_until_equal(&shared.computed, shared.n_threads);
+                    worker.update(epoch);
+                    shared.updated.fetch_add(1, Ordering::AcqRel);
                 }
             });
         }
@@ -977,41 +1130,32 @@ fn train(model: &Model, data: &Dataset, params: &mut Vec<Float>, cfg: &TrainConf
         let mut main_worker = Worker::new(model, data, &shared, 0);
         let inv_b = 1.0 / batch_size as Float;
         if logging {
-            snapshots.push((0, 0.0, Float::NAN, shared.params.read().unwrap().clone()));
+            // SAFETY: no worker is running yet.
+            snapshots.push((0, 0.0, Float::NAN, unsafe { shared.params.get(0..n_params) }.to_vec()));
         }
         for step in 0..num_steps {
             // publish the step; every worker (this thread included) claims documents via next_doc
             shared.next_doc.store(0, Ordering::Release);
-            shared.done.store(0, Ordering::Release);
+            shared.computed.store(0, Ordering::Release);
+            shared.updated.store(0, Ordering::Release);
             shared.epoch.store(step + 1, Ordering::Release);
             main_worker.run_step(step + 1);
-            wait_until_equal(&shared.done, n_threads - 1);
+            shared.computed.fetch_add(1, Ordering::AcqRel);
+            wait_until_equal(&shared.computed, n_threads);
+            main_worker.update(step + 1);
+            shared.updated.fetch_add(1, Ordering::AcqRel);
+            wait_until_equal(&shared.updated, n_threads);
 
-            // reduce the worker buffers, zeroing them for reuse
-            let mut loss_sum = 0.0;
-            for slot in &shared.slots {
-                loss_sum += *slot.loss.lock().unwrap();
-                let mut wg = slot.grad.lock().unwrap();
-                for (g, x) in grads.iter_mut().zip(wg.iter_mut()) {
-                    *g = x.mul_add(inv_b, *g);
-                    *x = 0.0;
-                }
-            }
-            loss = loss_sum * inv_b;
-
-            let lr_t = cfg.lr * (1.0 - step as Float / num_steps as Float); // linear decay
-            {
-                let mut p = shared.params.write().unwrap();
-                adam.step(&mut p, &mut grads, lr_t, step + 1);
-                model.transpose_into(&p, &mut shared.params_t.write().unwrap());
-            }
+            loss = shared.losses.iter().map(|l| *l.lock().unwrap()).sum::<Float>() * inv_b;
 
             if logging {
                 interval_loss += loss;
                 interval_steps += 1;
                 if (step + 1) % eval_every == 0 || step + 1 == num_steps {
                     let t = start.elapsed().as_secs_f64();
-                    snapshots.push((step + 1, t, interval_loss / interval_steps as Float, shared.params.read().unwrap().clone()));
+                    // SAFETY: all workers have passed the update barrier and are waiting on `epoch`.
+                    let snap = unsafe { shared.params.get(0..n_params) }.to_vec();
+                    snapshots.push((step + 1, t, interval_loss / interval_steps as Float, snap));
                     interval_loss = 0.0;
                     interval_steps = 0;
                 }
@@ -1026,7 +1170,7 @@ fn train(model: &Model, data: &Dataset, params: &mut Vec<Float>, cfg: &TrainConf
         Ok(())
     })?;
 
-    *params = shared.params.into_inner().unwrap();
+    *params = shared.params.into_vec();
 
     if let Some(path) = &cfg.log_path {
         let mut log = io::BufWriter::new(std::fs::File::create(path)?);

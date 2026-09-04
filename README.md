@@ -40,12 +40,16 @@ linearly to zero over the run.
 
 Parallelism is data parallelism over the documents of a batch. A pool of persistent worker threads
 (the main thread is one of them) claims documents from an atomic counter, so fast cores naturally
-take more work than slow ones, and each worker accumulates into its own gradient buffer. After the
-batch, the main thread sums the worker buffers, scales by `1/batch_size`, runs Adam, and publishes
-the next step by bumping an atomic epoch counter. Workers spin briefly then yield while waiting;
-a step is tens of microseconds, so parking threads on channels or condvars would cost more than
-the compute. Nothing allocates in steady state. Because which worker sums which document varies,
-multi-threaded results are deterministic only up to floating-point summation order.
+take more work than slow ones, and each worker accumulates into its own gradient buffer. Then, in
+a second phase behind a barrier, each worker owns a contiguous slice of the parameters: it sums
+that slice across all gradient buffers, applies Adam to it, and mirrors it into the transposed
+layout the forward pass reads. The main thread then publishes the next step by bumping an atomic
+epoch counter. The parameter, moment and gradient buffers are shared without locks; the two
+barriers per step are what make that sound (see `SharedBuf`). Workers spin briefly then yield
+while waiting; a step is tens of microseconds, so parking threads on channels or condvars would
+cost more than the compute. Nothing allocates in steady state. Because which worker sums which
+document varies, multi-threaded results are deterministic only up to floating-point summation
+order.
 
 ## Report
 
@@ -131,6 +135,7 @@ identical but removes the graph entirely:
 | **Vector FMA kernels** | Every accumulate uses `mul_add`, and the dot product keeps four independent lanes, so the reductions compile to one vector fused multiply-add per four elements instead of separate multiplies and adds in a serial chain (LLVM neither contracts `a*b+c` nor reassociates float sums on its own). Measured 13% faster per document. |
 | **Fused QKV projection** | `attn_wq`, `attn_wk`, `attn_wv` are one `48 x 16` matrix, so one matvec and one outer-product accumulate instead of three. |
 | **Spin-synchronised worker pool** | See above. Main thread works too, so `threads` is the number of computing threads. |
+| **Reduce-and-Adam fused into the workers** | The per-step tail (sum the gradient buffers, Adam, transpose) used to run on the main thread while the others spun. Each worker now does it for its own parameter slice behind a second barrier. The loops have to be flat: a first version with a chunked reduce and an index-table scatter was 3x slower per element because the vector sqrt/div ran latency-bound and the scatter defeated the store pipeline. 6-8% per step at 4-8 threads, 2% slower at 1 thread. |
 | **Build flags** | `opt-level=3`, fat LTO, one codegen unit, `panic=abort`, `target-cpu=native` (see `.cargo/config.toml`; drop that file for a portable binary). |
 
 Measured on an Apple M-series laptop with 8 performance + 2 efficiency cores:
@@ -141,7 +146,7 @@ Measured on an Apple M-series laptop with 8 performance + 2 efficiency cores:
 | `microgpt 1000 1 1` (same recipe) | ~15 ms |
 | `microgpt 20000 1 1` | ~290 ms (14.5 µs/step) |
 | `microgpt 20000 32 1` | ~4.7 s (235 µs/step, ~7.3 µs/doc) |
-| `microgpt 20000 16 4` (default) | ~0.92 s (46 µs/step, 2.6x over one thread) |
+| `microgpt 20000 16 4` (default) | ~0.88 s (44 µs/step, 2.8x over one thread) |
 | `microgpt 20000 32 8` | ~1.6 s (80 µs/step, 5x over one thread) |
 | `microgpt 5000 128 8` | ~1.3 s (250 µs/step, 8x over one thread) |
 
