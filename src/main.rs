@@ -1534,7 +1534,7 @@ fn hidden_hessians(model: &Model, data: &Dataset, p: &[Float], n_docs: usize) ->
     let mut acts = Acts::new(model.vocab_size);
     let mut tokens = Vec::with_capacity(BLOCK_SIZE + 2);
     let mut g = vec![vec![vec![0.0f64; H * H]; N_EXPERTS]; N_LAYER];
-    let mut m = vec![vec![0usize; N_EXPERTS]; N_LAYER];
+    let mut m = [[0usize; N_EXPERTS]; N_LAYER];
     for doc in &data.docs[..n_docs.min(data.n_train)] {
         data.tokenize(doc, &mut tokens);
         let n = (tokens.len() - 1).min(BLOCK_SIZE);
