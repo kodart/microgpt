@@ -1827,6 +1827,8 @@ fn main() -> io::Result<()> {
     };
     let temperature: Float = std::env::var("MICROGPT_TEMPERATURE").ok().and_then(|s| s.parse().ok()).unwrap_or(TEMPERATURE);
     let num_samples: usize = std::env::var("MICROGPT_SAMPLES").ok().and_then(|s| s.parse().ok()).unwrap_or(NUM_SAMPLES);
+    // nucleus sampling: keep the smallest set of tokens whose probability mass reaches top_p
+    let top_p: Float = std::env::var("MICROGPT_TOP_P").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
     println!(
         "model: {N_LAYER} layer(s), n_embd {N_EMBD}, {N_HEAD} heads, block size {BLOCK_SIZE}, {} | num params: {}",
         if MOE { format!("{N_EXPERTS} experts of width {N_HIDDEN}, top-{TOP_K}") } else { format!("dense MLP of width {N_HIDDEN}") },
@@ -1907,7 +1909,8 @@ fn main() -> io::Result<()> {
     let mut probs = vec![0.0 as Float; v];
     let mut params_t = vec![0.0 as Float; params.len()];
     model.transpose_into(&params, &mut params_t);
-    writeln!(out, "temperature {temperature}")?;
+    writeln!(out, "temperature {temperature} | top-p {top_p}")?;
+    let mut order: Vec<usize> = (0..v).collect();
     for sample_idx in 0..num_samples {
         tokens.clear();
         tokens.push(data.start);
@@ -1919,6 +1922,21 @@ fn main() -> io::Result<()> {
                 *pr = lg / temperature;
             }
             softmax_inplace(&mut probs);
+            if top_p < 1.0 {
+                order.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+                let mut mass = 0.0;
+                let mut keep = 0;
+                for &i in &order {
+                    mass += probs[i];
+                    keep += 1;
+                    if mass >= top_p {
+                        break;
+                    }
+                }
+                for &i in &order[keep..] {
+                    probs[i] = 0.0;
+                }
+            }
             let next = rng.choice_weighted(&probs);
             if next == data.stop {
                 break;
