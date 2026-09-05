@@ -86,6 +86,7 @@ Knobs, all environment variables so the positional arguments stay `[num_steps] [
 | `MICROGPT_TEMPERATURE` | 0.5 | sampling temperature |
 | `MICROGPT_TOP_P` | 1.0 | nucleus sampling: keep only the most probable tokens up to this mass |
 | `MICROGPT_SAMPLES` | 20 | number of samples to print |
+| `MICROGPT_PROMPT` | unset | token ids (space-separated) placed after the start token before sampling, e.g. a key/meter/tempo prefix |
 | `MICROGPT_SEED` | unset | reseed before parameter init; the data shuffle and held-out split always use seed 42, so losses stay comparable across seeds |
 
 Set `MICROGPT_LOG=<file.csv>` to record `step,train_time_s,train_loss,eval_loss` every

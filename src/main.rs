@@ -1829,6 +1829,8 @@ fn main() -> io::Result<()> {
     let num_samples: usize = std::env::var("MICROGPT_SAMPLES").ok().and_then(|s| s.parse().ok()).unwrap_or(NUM_SAMPLES);
     // nucleus sampling: keep the smallest set of tokens whose probability mass reaches top_p
     let top_p: Float = std::env::var("MICROGPT_TOP_P").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    // optional prompt: token ids placed after the start token before sampling (e.g. key/meter/tempo prefix)
+    let prompt: Vec<usize> = std::env::var("MICROGPT_PROMPT").ok().map(|s| s.split_whitespace().map(|t| t.parse().expect("MICROGPT_PROMPT must be token ids")).collect()).unwrap_or_default();
     println!(
         "model: {N_LAYER} layer(s), n_embd {N_EMBD}, {N_HEAD} heads, block size {BLOCK_SIZE}, {} | num params: {}",
         if MOE { format!("{N_EXPERTS} experts of width {N_HIDDEN}, top-{TOP_K}") } else { format!("dense MLP of width {N_HIDDEN}") },
@@ -1909,13 +1911,20 @@ fn main() -> io::Result<()> {
     let mut probs = vec![0.0 as Float; v];
     let mut params_t = vec![0.0 as Float; params.len()];
     model.transpose_into(&params, &mut params_t);
-    writeln!(out, "temperature {temperature} | top-p {top_p}")?;
+    writeln!(out, "temperature {temperature} | top-p {top_p}{}", if prompt.is_empty() { String::new() } else { format!(" | prompt {prompt:?}") })?;
     let mut order: Vec<usize> = (0..v).collect();
     for sample_idx in 0..num_samples {
         tokens.clear();
         tokens.push(data.start);
+        tokens.extend(prompt.iter().copied().filter(|&t| t < v));
         let mut sample = String::new();
-        for pos in 0..BLOCK_SIZE {
+        for t in &prompt {
+            sample.push_str(&format!("{t} "));
+        }
+        if tokens.len() > 1 {
+            model.forward(&params, &params_t, &tokens, 0, tokens.len() - 1, &mut acts); // prime the KV cache with the prompt
+        }
+        for pos in tokens.len() - 1..BLOCK_SIZE {
             model.forward(&params, &params_t, &tokens, pos, pos + 1, &mut acts); // earlier positions = KV cache
             let logits = row(&acts.logits, pos, v);
             for (pr, &lg) in probs.iter_mut().zip(logits) {
