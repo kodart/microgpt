@@ -81,6 +81,10 @@ Knobs, all environment variables so the positional arguments stay `[num_steps] [
 | `MICROGPT_EVAL_EVERY` | 100 | log interval in steps |
 | `MICROGPT_LR` | 0.01 | peak learning rate |
 | `MICROGPT_SCHEDULE` | linear | decay of the learning rate to zero over the run: `linear` (the gist), `cosine`, or `constant` (no decay) |
+| `MICROGPT_SAVE` | unset | write the trained parameters to this file (shape header + f32) |
+| `MICROGPT_LOAD` | unset | start from a saved checkpoint of the same build; with `0` steps this just evaluates and samples |
+| `MICROGPT_TEMPERATURE` | 0.5 | sampling temperature |
+| `MICROGPT_SAMPLES` | 20 | number of samples to print |
 | `MICROGPT_SEED` | unset | reseed before parameter init; the data shuffle and held-out split always use seed 42, so losses stay comparable across seeds |
 
 Set `MICROGPT_LOG=<file.csv>` to record `step,train_time_s,train_loss,eval_loss` every

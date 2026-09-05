@@ -56,8 +56,8 @@ const DEFAULT_NUM_STEPS: usize = 20000;
 const DEFAULT_BATCH_SIZE: usize = 16; // documents per optimizer step
 const DEFAULT_THREADS: usize = 4; // upper bound on the default thread count
 
-const TEMPERATURE: Float = 0.5; // in (0, 1], controls the "creativity" of generated text
-const NUM_SAMPLES: usize = 20;
+const TEMPERATURE: Float = 0.5; // default sampling temperature (MICROGPT_TEMPERATURE overrides)
+const NUM_SAMPLES: usize = 20; // default number of samples (MICROGPT_SAMPLES overrides)
 
 const N_EVAL_DOCS: usize = 1000; // held-out names used only to measure the loss
 
@@ -401,6 +401,45 @@ impl Model {
                 }
             }
         }
+    }
+
+    /// Checkpoint layout: magic "MGCK", then u32 vocab_size, n_layer, n_embd, n_head, block_size,
+    /// n_experts, top_k, n_hidden, n_params (the shape the file was trained with), then the
+    /// parameters as little-endian f32. Loading refuses a file whose shape differs from this build.
+    fn shape_header(&self) -> Vec<u8> {
+        let mut h = b"MGCK".to_vec();
+        for v in [self.vocab_size, N_LAYER, N_EMBD, N_HEAD, BLOCK_SIZE, N_EXPERTS, TOP_K, N_HIDDEN, self.n_params] {
+            h.extend_from_slice(&(v as u32).to_le_bytes());
+        }
+        h
+    }
+
+    fn save_checkpoint(&self, path: &str, p: &[Float]) -> io::Result<()> {
+        let mut bytes = self.shape_header();
+        for &x in p {
+            bytes.extend_from_slice(&x.to_le_bytes());
+        }
+        std::fs::write(path, bytes)
+    }
+
+    fn load_checkpoint(&self, path: &str) -> io::Result<Vec<Float>> {
+        let bytes = std::fs::read(path)?;
+        let header = self.shape_header();
+        if bytes.len() < header.len() || bytes[..4] != header[..4] {
+            return Err(io::Error::other(format!("{path}: not a microgpt checkpoint")));
+        }
+        if bytes[..header.len()] != header[..] {
+            let field = |i: usize| u32::from_le_bytes(bytes[4 + 4 * i..8 + 4 * i].try_into().unwrap());
+            return Err(io::Error::other(format!(
+                "{path}: checkpoint shape (vocab {}, {} layers, n_embd {}, {} heads, block {}, {} experts of {} top-{}, {} params) does not match this build",
+                field(0), field(1), field(2), field(3), field(4), field(5), field(7), field(6), field(8)
+            )));
+        }
+        let body = &bytes[header.len()..];
+        if body.len() != 4 * self.n_params {
+            return Err(io::Error::other(format!("{path}: truncated checkpoint")));
+        }
+        Ok(body.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as Float).collect())
     }
 
     /// Write the transposed layout of `p` into `pt`: every linear weight [out][in] becomes
@@ -1778,7 +1817,16 @@ fn main() -> io::Result<()> {
     println!("vocab size: {}", data.vocab_size());
 
     let model = Model::new(data.vocab_size());
-    let mut params = model.init_params(&mut rng);
+    let mut params = match std::env::var("MICROGPT_LOAD") {
+        Ok(path) => {
+            let p = model.load_checkpoint(&path)?;
+            println!("loaded checkpoint {path}");
+            p
+        }
+        Err(_) => model.init_params(&mut rng),
+    };
+    let temperature: Float = std::env::var("MICROGPT_TEMPERATURE").ok().and_then(|s| s.parse().ok()).unwrap_or(TEMPERATURE);
+    let num_samples: usize = std::env::var("MICROGPT_SAMPLES").ok().and_then(|s| s.parse().ok()).unwrap_or(NUM_SAMPLES);
     println!(
         "model: {N_LAYER} layer(s), n_embd {N_EMBD}, {N_HEAD} heads, block size {BLOCK_SIZE}, {} | num params: {}",
         if MOE { format!("{N_EXPERTS} experts of width {N_HIDDEN}, top-{TOP_K}") } else { format!("dense MLP of width {N_HIDDEN}") },
@@ -1800,13 +1848,19 @@ fn main() -> io::Result<()> {
     let loss = train(&model, &data, &mut params, &cfg, &mut out)?;
     let elapsed = start.elapsed();
     writeln!(out)?;
-    writeln!(
-        out,
-        "final loss {loss:.4} | trained {} steps x {} docs in {elapsed:.2?} ({:.1} us/step)",
-        cfg.num_steps,
-        cfg.batch_size,
-        elapsed.as_secs_f64() * 1e6 / cfg.num_steps as f64
-    )?;
+    if cfg.num_steps > 0 {
+        writeln!(
+            out,
+            "final loss {loss:.4} | trained {} steps x {} docs in {elapsed:.2?} ({:.1} us/step)",
+            cfg.num_steps,
+            cfg.batch_size,
+            elapsed.as_secs_f64() * 1e6 / cfg.num_steps as f64
+        )?;
+    }
+    if let Ok(path) = std::env::var("MICROGPT_SAVE") {
+        model.save_checkpoint(&path, &params)?;
+        writeln!(out, "saved checkpoint {path} ({} params)", params.len())?;
+    }
     let v = model.vocab_size;
     let mut acts = Acts::new(v);
     let mut tokens = Vec::with_capacity(BLOCK_SIZE + 2);
@@ -1853,7 +1907,8 @@ fn main() -> io::Result<()> {
     let mut probs = vec![0.0 as Float; v];
     let mut params_t = vec![0.0 as Float; params.len()];
     model.transpose_into(&params, &mut params_t);
-    for sample_idx in 0..NUM_SAMPLES {
+    writeln!(out, "temperature {temperature}")?;
+    for sample_idx in 0..num_samples {
         tokens.clear();
         tokens.push(data.start);
         let mut sample = String::new();
@@ -1861,7 +1916,7 @@ fn main() -> io::Result<()> {
             model.forward(&params, &params_t, &tokens, pos, pos + 1, &mut acts); // earlier positions = KV cache
             let logits = row(&acts.logits, pos, v);
             for (pr, &lg) in probs.iter_mut().zip(logits) {
-                *pr = lg / TEMPERATURE;
+                *pr = lg / temperature;
             }
             softmax_inplace(&mut probs);
             let next = rng.choice_weighted(&probs);
