@@ -60,6 +60,17 @@ loss curves are at [kodart.github.io/microgpt/loss-curves.html](https://kodart.g
 below: what each optimisation bought, thread scaling, batch size at equal data, the learning-rate
 sweep, seed noise, and model size at matched time budgets, with charts.
 
+## Training on a pre-tokenized corpus
+
+Set `MICROGPT_TOKENS=<path>/tokens.bin` to train on token sequences instead of `input.txt`.
+The file holds little-endian `u16` tokens; `<path>/tokens.idx.bin` beside it starts with the
+magic `MGPT`, a `u32` vocabulary size and a `u32` document count, then one 13-byte record per
+document: `u64` token offset, `u32` length, `u8` split (0 train, 1 held out). Every document
+must begin with token 1 (BOS) and end with token 2 (EOS); sampling starts from 1 and stops at 2
+and prints token ids. Documents longer than the block are truncated. This is the format the
+melody pipeline in the `wow` project writes; a 515k-melody, 207M-token corpus loads in about
+a second and the gist-sized model trains on it at ~270k tokens/s on 4 threads.
+
 ## Loss curves and experiments
 
 Knobs, all environment variables so the positional arguments stay `[num_steps] [batch_size] [threads]`:

@@ -916,7 +916,7 @@ impl Model {
 
 impl Model {
     /// Mean per-document loss over `docs` (forward only, no gradients).
-    fn eval_loss(&self, p: &[Float], data: &Dataset, docs: &[String], acts: &mut Acts, tokens: &mut Vec<usize>) -> Float {
+    fn eval_loss(&self, p: &[Float], data: &Dataset, docs: &[Vec<u16>], acts: &mut Acts, tokens: &mut Vec<usize>) -> Float {
         if docs.is_empty() {
             return Float::NAN;
         }
@@ -933,7 +933,7 @@ impl Model {
     }
 
     /// Per layer, the fraction of (position, slot) pairs of `docs` routed to each expert.
-    fn expert_usage(&self, p: &[Float], data: &Dataset, docs: &[String], acts: &mut Acts, tokens: &mut Vec<usize>) -> Vec<[Float; N_EXPERTS]> {
+    fn expert_usage(&self, p: &[Float], data: &Dataset, docs: &[Vec<u16>], acts: &mut Acts, tokens: &mut Vec<usize>) -> Vec<[Float; N_EXPERTS]> {
         let mut pt = vec![0.0 as Float; p.len()];
         self.transpose_into(p, &mut pt);
         let mut counts = [[0usize; N_EXPERTS]; N_LAYER];
@@ -956,7 +956,7 @@ impl Model {
     /// for each input character and for each position, as percentages of that row.
     /// Returned as (by_char[layer][char][expert], by_pos[layer][pos][expert]).
     #[allow(clippy::type_complexity)]
-    fn expert_routing(&self, p: &[Float], data: &Dataset, docs: &[String], acts: &mut Acts, tokens: &mut Vec<usize>) -> (Vec<Vec<[Float; N_EXPERTS]>>, Vec<Vec<[Float; N_EXPERTS]>>) {
+    fn expert_routing(&self, p: &[Float], data: &Dataset, docs: &[Vec<u16>], acts: &mut Acts, tokens: &mut Vec<usize>) -> (Vec<Vec<[Float; N_EXPERTS]>>, Vec<Vec<[Float; N_EXPERTS]>>) {
         let mut pt = vec![0.0 as Float; p.len()];
         self.transpose_into(p, &mut pt);
         let v = self.vocab_size;
@@ -1027,15 +1027,55 @@ impl Adam {
 // Data
 // ---------------------------------------------------------------------------------------------
 
+/// Documents are token sequences. Two ways to get them: `load_names` tokenizes a text file
+/// character by character (the gist's names.txt, one document per line), `load_tokens` reads a
+/// pre-tokenized corpus (`tokens.bin` of little-endian u16 plus `tokens.idx.bin`, as written by
+/// the melody pipeline's merge step). Either way docs[..n_train] are trained on and the rest
+/// are held out, every document starts with `start` and generation stops at `stop`.
 struct Dataset {
-    docs: Vec<String>, // shuffled; docs[..n_train] are trained on, docs[n_train..] are held out
+    docs: Vec<Vec<u16>>,
     n_train: usize,
-    uchars: Vec<char>, // sorted unique characters; index = token id
-    bos: usize,        // beginning-of-sequence token id
+    vocab_size: usize,
+    start: usize,
+    stop: usize,
+    uchars: Option<Vec<char>>, // names mode only: the character table, for printing samples
 }
 
 impl Dataset {
-    fn load(path: &str, rng: &mut Rng) -> io::Result<Self> {
+    /// Pre-tokenized corpus: `path` is tokens.bin; the index is `path` with `.bin` -> `.idx.bin`.
+    /// Index layout: magic "MGPT", u32 vocab_size, u32 n_docs, then per doc u64 offset (in
+    /// tokens), u32 length, u8 split (0 train, 1 held out). Training docs are shuffled.
+    fn load_tokens(path: &str, rng: &mut Rng) -> io::Result<Self> {
+        let idx_path = path.strip_suffix(".bin").unwrap_or(path).to_string() + ".idx.bin";
+        let idx = std::fs::read(&idx_path)?;
+        if idx.len() < 12 || &idx[..4] != b"MGPT" {
+            return Err(io::Error::other(format!("{idx_path}: not a microgpt token index")));
+        }
+        let u32_at = |i: usize| u32::from_le_bytes(idx[i..i + 4].try_into().unwrap()) as usize;
+        let vocab_size = u32_at(4);
+        let n_docs = u32_at(8);
+        let bytes = std::fs::read(path)?;
+        let tokens: Vec<u16> = bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+        let mut train = Vec::new();
+        let mut held = Vec::new();
+        for d in 0..n_docs {
+            let r = 12 + d * 13;
+            let off = u64::from_le_bytes(idx[r..r + 8].try_into().unwrap()) as usize;
+            let len = u32_at(r + 8);
+            let doc = tokens[off..off + len].to_vec();
+            if idx[r + 12] == 0 {
+                train.push(doc);
+            } else {
+                held.push(doc);
+            }
+        }
+        rng.shuffle(&mut train);
+        let n_train = train.len().max(1);
+        train.extend(held);
+        Ok(Dataset { docs: train, n_train, vocab_size, start: 1, stop: 2, uchars: None })
+    }
+
+    fn load_names(path: &str, rng: &mut Rng) -> io::Result<Self> {
         if !Path::new(path).exists() {
             eprintln!("downloading {NAMES_URL} -> {path}");
             let ok = Command::new("curl")
@@ -1053,33 +1093,57 @@ impl Dataset {
         let mut docs: Vec<String> =
             text.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
         rng.shuffle(&mut docs);
-        Ok(Self::new(docs, N_EVAL_DOCS))
+        Ok(Self::from_names(docs, N_EVAL_DOCS))
     }
 
-    /// The last `n_eval` documents are held out from training (at least one document is kept).
-    fn new(docs: Vec<String>, n_eval: usize) -> Self {
+    /// Character-level documents; the last `n_eval` are held out (at least one is trained on).
+    /// Every document becomes [BOS] + chars + [BOS], with BOS = number of distinct characters.
+    fn from_names(docs: Vec<String>, n_eval: usize) -> Self {
         let uchars: Vec<char> = docs.iter().flat_map(|d| d.chars()).collect::<BTreeSet<_>>().into_iter().collect();
         let bos = uchars.len();
         let n_train = docs.len().saturating_sub(n_eval).max(1);
-        Dataset { docs, n_train, uchars, bos }
+        let tok = |d: &str| -> Vec<u16> {
+            let mut v = vec![bos as u16];
+            v.extend(d.chars().map(|c| uchars.binary_search(&c).expect("character not in vocab") as u16));
+            v.push(bos as u16);
+            v
+        };
+        let docs = docs.iter().map(|d| tok(d)).collect();
+        Dataset { docs, n_train, vocab_size: uchars.len() + 1, start: bos, stop: bos, uchars: Some(uchars) }
     }
 
-    fn eval_docs(&self) -> &[String] {
+    fn eval_docs(&self) -> &[Vec<u16>] {
         &self.docs[self.n_train..]
     }
 
     fn vocab_size(&self) -> usize {
-        self.uchars.len() + 1
+        self.vocab_size
     }
 
-    /// [BOS] + chars + [BOS]
-    fn tokenize(&self, doc: &str, out: &mut Vec<usize>) {
+    /// Copy a document's tokens into the working buffer, keeping at most BLOCK_SIZE + 1 of them
+    /// (the model sees BLOCK_SIZE positions plus their targets; longer documents are truncated).
+    fn tokenize(&self, doc: &[u16], out: &mut Vec<usize>) {
         out.clear();
-        out.push(self.bos);
-        for ch in doc.chars() {
-            out.push(self.uchars.binary_search(&ch).expect("character not in vocab"));
+        out.extend(doc.iter().take(BLOCK_SIZE + 1).map(|&t| t as usize));
+    }
+
+    /// Names mode: tokenize a string the same way `from_names` did.
+    #[cfg(test)]
+    fn tokenize_str(&self, s: &str, out: &mut Vec<usize>) {
+        let uchars = self.uchars.as_ref().expect("tokenize_str needs a names dataset");
+        out.clear();
+        out.push(self.start);
+        out.extend(s.chars().map(|c| uchars.binary_search(&c).expect("character not in vocab")));
+        out.push(self.stop);
+    }
+
+    /// Printable form of a token: its character in names mode, its id otherwise.
+    fn token_label(&self, t: usize) -> String {
+        match &self.uchars {
+            Some(u) if t < u.len() => u[t].to_string(),
+            Some(_) => "BOS".to_string(),
+            None => t.to_string(),
         }
-        out.push(self.bos);
     }
 }
 
@@ -1702,7 +1766,10 @@ fn main() -> io::Result<()> {
     // are the same for every run. MICROGPT_SEED reseeds the generator after that, i.e. it changes
     // the parameter initialisation and the sampling, which keeps held-out losses comparable
     // between seeds. Unset, the single seed-42 stream continues as in the gist.
-    let data = Dataset::load("input.txt", &mut rng)?;
+    let data = match std::env::var("MICROGPT_TOKENS") {
+        Ok(path) => Dataset::load_tokens(&path, &mut rng)?,
+        Err(_) => Dataset::load_names("input.txt", &mut rng)?,
+    };
     let seed: Option<u64> = std::env::var("MICROGPT_SEED").ok().map(|s| s.parse().expect("MICROGPT_SEED must be an integer"));
     if let Some(seed) = seed {
         rng = Rng::new(seed);
@@ -1757,7 +1824,7 @@ fn main() -> io::Result<()> {
                 writeln!(out, "--- layer {l}: primary expert by input character (% of that character's positions)")?;
                 writeln!(out, "   char{header}")?;
                 for (t, row) in by_char[l].iter().enumerate() {
-                    let label = if t == data.bos { "BOS".to_string() } else { data.uchars[t].to_string() };
+                    let label = data.token_label(t);
                     let cells: String = row.iter().map(|x| format!("{:>4.0}", 100.0 * x)).collect();
                     writeln!(out, "   {label:>4}{cells}")?;
                 }
@@ -1782,13 +1849,13 @@ fn main() -> io::Result<()> {
     }
 
     // Inference: may the model babble back to us
-    writeln!(out, "--- inference (new, hallucinated names) ---")?;
+    writeln!(out, "--- inference ({}) ---", if data.uchars.is_some() { "new, hallucinated names" } else { "token ids, decode with the corpus tokenizer" })?;
     let mut probs = vec![0.0 as Float; v];
     let mut params_t = vec![0.0 as Float; params.len()];
     model.transpose_into(&params, &mut params_t);
     for sample_idx in 0..NUM_SAMPLES {
         tokens.clear();
-        tokens.push(data.bos);
+        tokens.push(data.start);
         let mut sample = String::new();
         for pos in 0..BLOCK_SIZE {
             model.forward(&params, &params_t, &tokens, pos, pos + 1, &mut acts); // earlier positions = KV cache
@@ -1798,10 +1865,14 @@ fn main() -> io::Result<()> {
             }
             softmax_inplace(&mut probs);
             let next = rng.choice_weighted(&probs);
-            if next == data.bos {
+            if next == data.stop {
                 break;
             }
-            sample.push(data.uchars[next]);
+            if data.uchars.is_some() {
+                sample.push_str(&data.token_label(next));
+            } else {
+                sample.push_str(&format!("{next} "));
+            }
             tokens.push(next);
         }
         writeln!(out, "sample {:2}: {}", sample_idx + 1, sample)?;
@@ -1822,7 +1893,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        Dataset::new(docs, 0)
+        Dataset::from_names(docs, 0)
     }
 
     fn full_loss(model: &Model, p: &[Float], tokens: &[usize], n: usize, acts: &mut Acts) -> Float {
@@ -1847,7 +1918,7 @@ mod tests {
         let mut scratch = Grads::new(model.vocab_size);
 
         let mut tokens = Vec::new();
-        data.tokenize("charlotte", &mut tokens);
+        data.tokenize_str("charlotte", &mut tokens);
         let n = (tokens.len() - 1).min(BLOCK_SIZE);
 
         full_loss(&model, &params, &tokens, n, &mut acts);
@@ -1896,7 +1967,7 @@ mod tests {
         let model = Model::new(data.vocab_size());
         let params = model.init_params(&mut rng);
         let mut tokens = Vec::new();
-        data.tokenize("isabella", &mut tokens);
+        data.tokenize_str("isabella", &mut tokens);
         let n = tokens.len() - 1;
 
         let mut pt = vec![0.0; params.len()];
